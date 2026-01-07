@@ -29,6 +29,8 @@ running = False
 thread_list = []
 # 记录待下载的磁力链接
 mag_urls = []
+# 登录锁
+login_lock = threading.Lock()
 # PTB所需
 if TG_API_URL[-1] == '/':
     updater = Updater(token=TOKEN, base_url=f"{TG_API_URL}bot", base_file_url=f"{TG_API_URL}file/bot")
@@ -91,25 +93,26 @@ def start(update: Update, context: CallbackContext):
 
 # 账号密码登录
 def login(account):
-    index = USER.index(account)
+    with login_lock:
+        index = USER.index(account)
 
-    # 登录所需所有信息
-    login_admin = account
-    login_password = PASSWORD[index]
+        # 登录所需所有信息
+        login_admin = account
+        login_password = PASSWORD[index]
 
-    client = PikPakApi(
-        username=login_admin,
-        password=login_password,
-    )
+        client = PikPakApi(
+            username=login_admin,
+            password=login_password,
+        )
 
-    # 执行异步的登录和刷新操作，并等待完成
-    asyncio.run(client.login())
-    asyncio.run(client.refresh_access_token())
-    headers = client.get_headers()
-    pikpak_headers[index] = headers.copy()  # 拷贝
-    pikpak_clients[index] = client
+        # 执行异步的登录和刷新操作，并等待完成
+        asyncio.run(client.login())
+        asyncio.run(client.refresh_access_token())
+        headers = client.get_headers()
+        pikpak_headers[index] = headers.copy()  # 拷贝
+        pikpak_clients[index] = client
 
-    logging.info(f"账号{account}登陆成功！")
+        logging.info(f"账号{account}登陆成功！")
 
 
 # 获得headers，用于请求api
@@ -388,8 +391,6 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None):
 
     try:  # 捕捉所有的请求超时异常
         for each_account in USER:
-            # 登录
-            login(each_account)  # 指定用哪个账户登录
             # 离线下载并获取任务id和文件名
             mag_id, mag_name = magnet_upload(magnet, each_account, offline_path=offline_path)
 
@@ -402,11 +403,10 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None):
 
             # 查询是否离线完成
             done = False  # 是否完成标志
-            zero_process = False  # 是否卡在零进度标志
             logging.info('5s后将检查离线下载进度...')
             sleep(5)  # 等待5秒，一般是秒离线，可以保证大多数情况下直接就完成了离线下载
             offline_start = time()  # 离线开始时间
-            while (not done) and (time() - offline_start < 60 * 2):  # 要么完成要么超时
+            while (not done) and (time() - offline_start < 60 * 60):  # 1小时超时
                 temp = get_offline_list(each_account)  # 获取离线列表
                 find = False  # 离线列表中找到了任务id的标志
                 for each_down in temp:
@@ -427,21 +427,10 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None):
                                          f'{each_down["message"].strip()}！\n文件名称：{mag_name}'
                             context.bot.send_message(chat_id=update.effective_chat.id, text=print_info)
                             logging.warning(print_info)
-                        elif each_down['progress'] == 0:  # 共20s都卡在进度0，则认为网盘无法离线此文件
-                            if zero_process:  # 如果上一次查询就是零进度了，这次又是零进度
-                                find = False
-                                print_info = f'账号{each_account}离线{mag_url_simple}进度卡在0%，将取消离线任务'
-                                context.bot.send_message(chat_id=update.effective_chat.id, text=print_info)
-                                logging.warning(print_info)
-                            else:
-                                zero_process = True
-                                logging.warning(
-                                    f'账号{each_account}离线{mag_url_simple}任务进度为0%，将在15s后再次查看...')
-                                sleep(15)
                         else:
                             logging.info(
                                 f'账号{each_account}离线下载{mag_url_simple}还未完成，进度{each_down["progress"]}...')
-                            sleep(5)
+                            sleep(10)
                         # 只要找到了就可以退出查找循环
                         break
                 # 非正常退出查询离线完成方式
@@ -455,7 +444,7 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None):
             if (find and done) or (not find and not done):  # 前者找到离线任务并且完成了，后者是要么手动取消了要么卡在进度0
                 break
             elif find and not done:
-                print_info = f'账号{each_account}离线下载{mag_url_simple}的任务超时！已取消该任务！'
+                print_info = f'账号{each_account}离线下载{mag_url_simple}的任务超时（1小时）！已取消该任务！'
                 context.bot.send_message(chat_id=update.effective_chat.id, text=print_info)
                 logging.warning(print_info)
                 break
