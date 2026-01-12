@@ -1351,13 +1351,8 @@ def account_manage(update: Update, context: CallbackContext):
 
 
 def path(update: Update, context: CallbackContext):
-    """
-    設置網盤離線下載路徑
-    :param update:
-    :param context:
-    :return:
-    """
-    argv = context.args  # 获取命令参数
+    """設置網盤離線下載路徑"""
+    argv = context.args  # 獲取命令參數
     global PIKPAK_OFFLINE_PATH
     if len(argv) == 0:
         context.bot.send_message(chat_id=update.effective_chat.id,
