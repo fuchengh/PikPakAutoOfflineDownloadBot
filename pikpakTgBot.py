@@ -115,7 +115,14 @@ def api_add():
 
     # 通知 Telegram
     try:
-        updater.bot.send_message(chat_id=ADMIN_IDS[0], text=f"📥 收到來自 Web UI 的 {len(magnets)} 個下載任務")
+        msg = f"📥 收到來自 Web UI 的 {len(magnets)} 個下載任務：\n\n"
+        for i, mag in enumerate(magnets, 1):
+            # 簡化連結顯示，只取 xt 部分
+            mag_url_part = re.search(r'xt=.+?(&|$)', mag)
+            mag_simple = mag_url_part.group(0).rstrip('&') if mag_url_part else mag[:40] + "..."
+            msg += f"{i}. <code>{mag_simple}</code>\n"
+        
+        updater.bot.send_message(chat_id=ADMIN_IDS[0], text=msg, parse_mode='HTML')
     except Exception as e:
         logging.error(f"Web UI 通知發送失敗: {e}")
 
