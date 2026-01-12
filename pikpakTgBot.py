@@ -128,6 +128,8 @@ def api_add():
     for magnet in magnets:
         thread_list.append(threading.Thread(target=main, args=[mock_update, None, magnet, offline_path, batch_id]))
         thread_list[-1].start()
+        # 增加延遲，避免同時發起過多請求導致 PikPak 報錯 (HTTP 400 operation too frequent)
+        sleep(2)
 
     return jsonify({'status': 'ok', 'count': len(magnets)})
 
@@ -278,8 +280,14 @@ def login(account):
         )
 
         # 执行异步的登录和刷新操作，并等待完成
-        asyncio.run(client.login())
-        asyncio.run(client.refresh_access_token())
+        # 使用新的事件循環以避免 "Event loop is closed" 錯誤
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(client.login())
+            loop.run_until_complete(client.refresh_access_token())
+        finally:
+            loop.close()
         headers = client.get_headers()
         pikpak_headers[index] = headers.copy()  # 拷贝
         pikpak_clients[index] = client
