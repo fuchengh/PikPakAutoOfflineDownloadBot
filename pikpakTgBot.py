@@ -983,12 +983,11 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None, ba
                     sleep(20)
 
     except requests.exceptions.ReadTimeout:
-        print_info = f'下載磁力{mag_url_simple}時網路請求超時！可稍後重試`/pikpak {mag_url_simple}`'
-        safe_send_message(print_info, parse_mode='Markdown')
-        logging.error(print_info)
-        record_batch_result(batch_id, 'fail', mag_url_simple, "網路請求超時", update, context)
+        # 即使發生超時，也不要直接判定失敗，因為可能是查詢狀態時的短暫超時
+        logging.warning(f'下載磁力{mag_url_simple}期間發生網路請求超時，但任務可能仍在進行中。')
+        # 不發送失敗通知，讓它自然結束或由其他邏輯處理
     except Exception as e:
-        logging.error(f"未知錯誤: {e}")
+        logging.error(f"處理磁力{mag_url_simple}時發生未知錯誤: {e}")
         record_batch_result(batch_id, 'fail', mag_url_simple, f"發生未知錯誤: {str(e)}", update, context)
 
 
