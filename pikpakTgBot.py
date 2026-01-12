@@ -157,47 +157,83 @@ def call_aria2(method, params=None):
 
 @app.route('/api/stats')
 def api_stats():
-    # 獲取正在下載和等待中的任務
-    # 請求的欄位: gid, totalLength, completedLength, uploadLength, downloadSpeed, uploadSpeed, infoHash, numSeeders, seeder, status, errorCode, verifiedLength, verifyIntegrityPending
-    keys = ["gid", "status", "files", "totalLength", "completedLength", "downloadSpeed", "errorMessage"]
+    tasks = []
     
+    # 1. 獲取 PikPak 離線任務 (僅獲取第一個帳號，避免請求過多)
+    try:
+        if USER:
+            # 注意：這裡假設 get_offline_list 可以直接被調用，且 USER[0] 是有效的
+            # 為了避免頻繁調用導致被封，這裡最好能加個緩存，但為了簡單先直接調用
+            # 如果 get_offline_list 失敗，不會影響 Aria2 的顯示
+            pikpak_tasks = get_offline_list(USER[0])
+            for task in pikpak_tasks:
+                # 只顯示未完成的，或者剛完成但還沒被清理的
+                # PikPak 的 status: PHASE_TYPE_RUNNING, PHASE_TYPE_COMPLETE, PHASE_TYPE_ERROR
+                phase = task.get('phase')
+                progress = int(task.get('progress', 0))
+                
+                if phase == 'PHASE_TYPE_COMPLETE' and progress == 100:
+                     # 已完成但還沒被清理的，顯示為雲端完成
+                     status = 'cloud_complete'
+                elif phase == 'PHASE_TYPE_ERROR':
+                     status = 'cloud_error'
+                else:
+                     status = 'cloud_downloading'
+                
+                # 如果是已完成且很久之前的任務，可能不需要顯示，但這裡先全部顯示，前端過濾
+                
+                tasks.append({
+                    'type': 'pikpak',
+                    'gid': task.get('id'),
+                    'name': task.get('name') or task.get('file_name') or 'Unknown',
+                    'status': status,
+                    'total': int(task.get('file_size', 0)),
+                    'completed': int(task.get('file_size', 0)) * progress // 100,
+                    'speed': 0, # PikPak API 通常不返回即時速度
+                    'progress': progress,
+                    'error': task.get('message', '') if phase == 'PHASE_TYPE_ERROR' else ''
+                })
+    except Exception as e:
+        # logging.error(f"PikPak Stats Error: {e}") # 降低日誌級別或暫時忽略，避免刷屏
+        pass
+
+    # 2. 獲取 Aria2 任務
+    keys = ["gid", "status", "files", "totalLength", "completedLength", "downloadSpeed", "errorMessage"]
     try:
         active = call_aria2('aria2.tellActive', [keys])
-        waiting = call_aria2('aria2.tellWaiting', [0, 100, keys]) # 取前100個等待中/暫停的
-        # stopped = call_aria2('aria2.tellStopped', [0, 10, keys]) # 也可以取已完成的，暫時先不用
+        waiting = call_aria2('aria2.tellWaiting', [0, 100, keys])
+        all_aria_tasks = active + waiting
         
-        all_tasks = active + waiting
-        
-        # 簡單處理一下數據，方便前端顯示
-        processed_tasks = []
-        for task in all_tasks:
-            # 獲取文件名 (如果有的話)
+        for task in all_aria_tasks:
             name = "Unknown"
             if task.get('files') and len(task['files']) > 0:
-                # 嘗試獲取路徑中的文件名
                 path = task['files'][0].get('path', '')
                 if path:
                     name = os.path.basename(path)
                 else:
-                    # 如果沒有path (meta data階段), 嘗試用 uris
                     uris = task['files'][0].get('uris', [])
                     if uris:
                         name = uris[0].get('uri', 'Unknown')
 
-            processed_tasks.append({
+            total = int(task.get('totalLength', 0))
+            completed = int(task.get('completedLength', 0))
+            progress = int(completed / total * 100) if total > 0 else 0
+
+            tasks.append({
+                'type': 'aria2',
                 'gid': task.get('gid'),
                 'name': name,
-                'status': task.get('status'),
-                'total': int(task.get('totalLength', 0)),
-                'completed': int(task.get('completedLength', 0)),
+                'status': task.get('status'), # active, waiting, paused, error, complete
+                'total': total,
+                'completed': completed,
                 'speed': int(task.get('downloadSpeed', 0)),
+                'progress': progress,
                 'error': task.get('errorMessage', '')
             })
-            
-        return jsonify({'tasks': processed_tasks})
     except Exception as e:
-        logging.error(f"API Stats Error: {e}")
-        return jsonify({'tasks': []})
+        logging.error(f"Aria2 Stats Error: {e}")
+
+    return jsonify({'tasks': tasks})
 
 def run_flask():
     # 關閉 Flask 的啟動 banner
@@ -696,8 +732,10 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None, ba
                                 safe_send_message(print_info)
                                 logging.warning(print_info)
                             else:
+                                # 嘗試獲取文件名以便顯示更友好的日誌
+                                current_file_name = each_down.get('file_name') or each_down.get('name') or mag_name or mag_url_simple
                                 logging.info(
-                                    f'帳號{each_account}離線下載{mag_url_simple}還未完成，進度{each_down["progress"]}'
+                                    f'帳號{each_account}離線下載 "{current_file_name}" 還未完成，進度{each_down["progress"]}%...'
                                 )
                                 sleep(10)
                             # 只要找到了就可以退出查找循环

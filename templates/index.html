@@ -130,17 +130,23 @@
             case 'waiting': return 'status-waiting';
             case 'paused': return 'status-paused';
             case 'error': return 'status-error';
+            case 'cloud_downloading': return 'status-active text-primary';
+            case 'cloud_complete': return 'status-active text-success';
+            case 'cloud_error': return 'status-error';
             default: return '';
         }
     }
 
     function getStatusText(status) {
         switch(status) {
-            case 'active': return '下載中';
-            case 'waiting': return '等待中';
-            case 'paused': return '暫停';
-            case 'error': return '錯誤';
-            case 'complete': return '完成';
+            case 'active': return '下載中 (Aria2)';
+            case 'waiting': return '等待中 (Aria2)';
+            case 'paused': return '暫停 (Aria2)';
+            case 'error': return '錯誤 (Aria2)';
+            case 'complete': return '完成 (Aria2)';
+            case 'cloud_downloading': return '☁️ 離線下載中';
+            case 'cloud_complete': return '☁️ 離線完成';
+            case 'cloud_error': return '☁️ 離線錯誤';
             default: return status;
         }
     }
@@ -220,21 +226,31 @@
             }
 
             const html = data.tasks.map(task => {
-                const percent = task.total > 0 ? (task.completed / task.total * 100).toFixed(1) : 0;
-                const eta = task.speed > 0 ? formatTime((task.total - task.completed) / task.speed) : '∞';
+                const percent = task.progress || (task.total > 0 ? (task.completed / task.total * 100).toFixed(1) : 0);
+                const eta = task.speed > 0 ? formatTime((task.total - task.completed) / task.speed) : (task.status === 'cloud_downloading' ? '雲端處理中' : '--');
                 const statusClass = getStatusClass(task.status);
+                
+                let typeBadge = '';
+                if (task.type === 'pikpak') {
+                    typeBadge = '<span class="badge bg-info me-1">PikPak</span>';
+                } else {
+                    typeBadge = '<span class="badge bg-success me-1">Aria2</span>';
+                }
                 
                 return `
                     <tr>
                         <td>
-                            <div class="fw-bold text-truncate" style="max-width: 300px;" title="${task.name}">${task.name}</div>
-                            ${task.error ? `<div class="text-danger small">${task.error}</div>` : ''}
+                            <div class="d-flex align-items-center">
+                                ${typeBadge}
+                                <div class="fw-bold text-truncate" style="max-width: 250px;" title="${task.name}">${task.name}</div>
+                            </div>
+                            ${task.error ? `<div class="text-danger small ms-1">${task.error}</div>` : ''}
                         </td>
-                        <td class="${statusClass}">${getStatusText(task.status)}</td>
+                        <td class="${statusClass} small">${getStatusText(task.status)}</td>
                         <td>
                             <div class="d-flex align-items-center">
                                 <div class="progress flex-grow-1 me-2" style="height: 10px;">
-                                    <div class="progress-bar ${task.status === 'active' ? 'progress-bar-striped progress-bar-animated' : ''}" 
+                                    <div class="progress-bar ${task.status === 'active' || task.status === 'cloud_downloading' ? 'progress-bar-striped progress-bar-animated' : ''}" 
                                          role="progressbar" 
                                          style="width: ${percent}%"></div>
                                 </div>
@@ -245,7 +261,7 @@
                             <div class="fw-bold">${formatBytes(task.speed)}/s</div>
                             <div class="small text-muted">${formatBytes(task.total)}</div>
                         </td>
-                        <td class="text-muted font-monospace">${eta}</td>
+                        <td class="text-muted font-monospace small">${eta}</td>
                     </tr>
                 `;
             }).join('');
