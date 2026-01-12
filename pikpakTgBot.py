@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import uuid
 from time import sleep, time
@@ -243,8 +244,9 @@ def run_flask():
     # 關閉 Flask 的啟動 banner
     cli = sys.modules['flask.cli']
     cli.show_server_banner = lambda *x: None
-    # 運行在 0.0.0.0 讓外部可訪問，端口 5000
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    # 運行在 0.0.0.0 讓外部可訪問
+    port = int(globals().get('WEB_PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 
 # 用户限制：Stack Overflow 用户@Majid提供的方法
@@ -1406,7 +1408,8 @@ flask_thread = threading.Thread(target=run_flask)
 flask_thread.daemon = True
 flask_thread.start()
 
-logging.info("Web UI 已啟動，請訪問 http://localhost:5000")
+port = int(globals().get('WEB_PORT', 5000))
+logging.info(f"Web UI 已啟動，請訪問 http://localhost:{port}")
 
 updater.start_polling()
 updater.idle()

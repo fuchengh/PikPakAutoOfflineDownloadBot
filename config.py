@@ -20,3 +20,6 @@ TG_API_URL = 'https://api.telegram.org'
 
 # 自定义Pikpak离线下载路径
 PIKPAK_OFFLINE_PATH = "None"
+
+# Web UI 端口
+WEB_PORT = 5000
