@@ -133,6 +133,11 @@ def run_flask():
     # 關閉 Flask 的啟動 banner
     cli = sys.modules['flask.cli']
     cli.show_server_banner = lambda *x: None
+    
+    # 隱藏 Werkzeug 的訪問日誌
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+    
     # 運行在 0.0.0.0 讓外部可訪問
     port = int(globals().get('WEB_PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
