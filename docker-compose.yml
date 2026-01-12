@@ -11,6 +11,8 @@ services:
     volumes:
       - .:/code                # 將當前程式碼映射進去 (包含 config.py)
       - ./downloads:/downloads # 下載路徑映射 (宿主機:容器內)
+    ports:
+      - "5000:5000"            # Web UI 端口
     depends_on:
       - aria2
     # 網路設定：確保 bot 可以用 'aria2' 這個名字找到下載器

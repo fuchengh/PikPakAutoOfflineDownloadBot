@@ -11,10 +11,38 @@ import requests
 import telegram
 from telegram import Update
 from telegram.ext import Updater, CallbackContext, CommandHandler, Handler, MessageHandler, Filters
+from flask import Flask, request, render_template_string, jsonify
 
 from config import *
 
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+# 配置 Flask
+app = Flask(__name__)
+# 用來存儲最新的日誌訊息，供 Web UI 顯示
+log_buffer = []
+MAX_LOG_SIZE = 100
+
+class ListBuffer(logging.Handler):
+    def emit(self, record):
+        log_entry = self.format(record)
+        log_buffer.append(log_entry)
+        if len(log_buffer) > MAX_LOG_SIZE:
+            log_buffer.pop(0)
+
+# 設置日誌
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+# 添加自定義 Handler 到 log_buffer
+buffer_handler = ListBuffer()
+buffer_handler.setFormatter(formatter)
+logger.addHandler(buffer_handler)
+
+# 也可以保留控制台輸出
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
 
 # 全局变量
 SCHEMA = 'https' if ARIA2_HTTPS else 'http'
@@ -44,6 +72,180 @@ else:
     updater = Updater(token=TOKEN, base_url=f"{TG_API_URL}/bot", base_file_url=f"{TG_API_URL}/file/bot")
 
 dispatcher = updater.dispatcher
+
+# Web UI HTML Template
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PikPak 下載助手</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8f9fa; padding-top: 20px; }
+        .log-container { 
+            background-color: #212529; 
+            color: #0f0; 
+            font-family: monospace; 
+            padding: 15px; 
+            border-radius: 5px; 
+            height: 400px; 
+            overflow-y: auto; 
+            font-size: 0.9rem;
+        }
+        .status-badge { font-size: 0.8em; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h2 class="mb-4">🚀 PikPak 自動下載助手</h2>
+    
+    <div class="card mb-4 shadow-sm">
+        <div class="card-header bg-primary text-white">
+            <h5 class="mb-0">新增磁力連結 (Add Magnet)</h5>
+        </div>
+        <div class="card-body">
+            <form id="magnetForm">
+                <div class="mb-3">
+                    <label for="magnets" class="form-label">請貼上磁力連結 (一行一個)</label>
+                    <textarea class="form-control" id="magnets" rows="5" placeholder="magnet:?xt=urn:btih:..."></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">🚀 提交下載</button>
+            </form>
+            <div id="resultMessage" class="mt-3"></div>
+        </div>
+    </div>
+
+    <div class="card shadow-sm">
+        <div class="card-header bg-dark text-white d-flex justify-content-between align-items-center">
+            <h5 class="mb-0">運行日誌 (Live Logs)</h5>
+            <button class="btn btn-sm btn-outline-light" onclick="fetchLogs()">刷新</button>
+        </div>
+        <div class="card-body bg-dark p-0">
+            <div id="logArea" class="log-container">載入中...</div>
+        </div>
+    </div>
+</div>
+
+<script>
+    document.getElementById('magnetForm').addEventListener('submit', async function(e) {
+        e.preventDefault();
+        const magnets = document.getElementById('magnets').value;
+        const btn = this.querySelector('button');
+        const msgDiv = document.getElementById('resultMessage');
+        
+        if (!magnets.trim()) return;
+
+        btn.disabled = true;
+        btn.innerHTML = '處理中...';
+        msgDiv.innerHTML = '';
+
+        try {
+            const response = await fetch('/api/add', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({magnets: magnets})
+            });
+            const data = await response.json();
+            
+            if (data.status === 'ok') {
+                msgDiv.innerHTML = `<div class="alert alert-success">✅ 已成功添加 ${data.count} 個任務！</div>`;
+                document.getElementById('magnets').value = '';
+                fetchLogs();
+            } else {
+                msgDiv.innerHTML = `<div class="alert alert-danger">❌ 錯誤: ${data.message}</div>`;
+            }
+        } catch (error) {
+            msgDiv.innerHTML = `<div class="alert alert-danger">❌ 請求失敗: ${error}</div>`;
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = '🚀 提交下載';
+        }
+    });
+
+    async function fetchLogs() {
+        try {
+            const response = await fetch('/api/logs');
+            const data = await response.json();
+            const logArea = document.getElementById('logArea');
+            logArea.innerHTML = data.logs.join('<br>');
+            logArea.scrollTop = logArea.scrollHeight;
+        } catch (e) {
+            console.error(e);
+        }
+    }
+
+    // Auto refresh logs every 3 seconds
+    setInterval(fetchLogs, 3000);
+    fetchLogs();
+</script>
+</body>
+</html>
+""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/add', methods=['POST'])
+def api_add():
+    data = request.json
+    content = data.get('magnets', '')
+    
+    # 簡單的正則提取磁力鏈接
+    magnets = re.findall(r'magnet:\?xt=urn:btih:[0-9a-fA-F]{40,}.*', content)
+    
+    if not magnets:
+        return jsonify({'status': 'error', 'message': '未找到有效的磁力連結'}), 400
+
+    # 模擬 TG update 對象，讓 main 函數可以運作
+    # 注意：這裡我們使用一個假的 update 對象，只為了兼容 main 函數的參數
+    # 因為 main 函數會用到 update.effective_chat.id 來發送通知
+    # 我們這裡取 ADMIN_IDS[0] 作為通知對象
+    
+    class MockChat:
+        id = ADMIN_IDS[0]
+        
+    class MockUpdate:
+        effective_chat = MockChat()
+        
+    mock_update = MockUpdate()
+    
+    # 初始化批量任務追蹤
+    batch_id = str(uuid.uuid4())[:8]
+    with batch_lock:
+            batch_results[batch_id] = {
+                'total': len(magnets),
+                'processed': 0,
+                'results': []
+            }
+            
+    logging.info(f"Web UI 收到 {len(magnets)} 個磁力下載請求")
+
+    # 啟動下載線程
+    global PIKPAK_OFFLINE_PATH
+    offline_path = None
+    if str(PIKPAK_OFFLINE_PATH) not in ["None", "/My Pack"]:
+        offline_path = PIKPAK_OFFLINE_PATH
+
+    for magnet in magnets:
+        thread_list.append(threading.Thread(target=main, args=[mock_update, None, magnet, offline_path, batch_id]))
+        thread_list[-1].start()
+
+    return jsonify({'status': 'ok', 'count': len(magnets)})
+
+@app.route('/api/logs')
+def api_logs():
+    return jsonify({'logs': log_buffer})
+
+def run_flask():
+    # 關閉 Flask 的啟動 banner
+    cli = sys.modules['flask.cli']
+    cli.show_server_banner = lambda *x: None
+    # 運行在 0.0.0.0 讓外部可訪問，端口 5000
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+
 
 # 用户限制：Stack Overflow 用户@Majid提供的方法
 # from: https://stackoverflow.com/questions/62466399/how-can-i-restrict-a-telegram-bots-use-to-some-users-only#answers-header
@@ -262,7 +464,7 @@ def get_list(folder_id, account):
         # 准备信息
         login_headers = get_headers(account)
         list_url = f"{PIKPAK_API_URL}/drive/v1/files?parent_id={folder_id}&thumbnail_size=SIZE_LARGE" + \
-                   "&filters=%7B%5C"trashed%5C":%7B%5C"eq%5C":false%7D%7D"
+                   "&filters=%7B%22trashed%22:%7B%22eq%22:false%7D%7D"
         # 发送请求
         list_result = requests.get(url=list_url, headers=login_headers, timeout=5).json()
         # 处理错误
@@ -282,7 +484,7 @@ def get_list(folder_id, account):
         while list_result['next_page_token'] != "":
             list_url = f"{PIKPAK_API_URL}/drive/v1/files?parent_id={folder_id}&page_token=" + list_result[
                 'next_page_token'] + \
-                       "&thumbnail_size=SIZE_LARGE" + "&filters=%7B%5C"trashed%5C":%7B%5C"eq%5C":false%7D "
+                       "&thumbnail_size=SIZE_LARGE" + "&filters=%7B%22trashed%22:%7B%22eq%22:false%7D%7D "
 
             list_result = requests.get(url=list_url, headers=login_headers, timeout=5).json()
 
@@ -439,10 +641,12 @@ def record_batch_result(batch_id, status, name, message, update, context):
                 if res['message']:
                      summary += f"   └ {res['message']}\n"
 
-            try:
-                context.bot.send_message(chat_id=update.effective_chat.id, text=summary, parse_mode='HTML')
-            except Exception as e:
-                logging.error(f"發送匯總通知失敗: {e}")
+            # Check if context and update are valid (might be None for Web requests)
+            if context and update and update.effective_chat:
+                try:
+                    context.bot.send_message(chat_id=update.effective_chat.id, text=summary, parse_mode='HTML')
+                except Exception as e:
+                    logging.error(f"發送匯總通知失敗: {e}")
             
             # 清理記錄
             del batch_results[batch_id]
@@ -456,6 +660,14 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None, ba
         mag_url_simple = ''.join(mag_url_part.groups()[:-1])
     else:
         mag_url_simple = magnet
+
+    # Helper function to safely send messages
+    def safe_send_message(text, parse_mode=None):
+        if context and update and update.effective_chat:
+            try:
+                context.bot.send_message(chat_id=update.effective_chat.id, text=text, parse_mode=parse_mode)
+            except Exception as e:
+                logging.error(f"Failed to send Telegram message: {e}")
 
     try:  # 捕捉所有的请求超时异常
         for each_account in USER:
@@ -476,7 +688,7 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None, ba
             if not mag_id:  # 如果添加离线失败，那就试试下一个账号
                 if each_account == USER[-1]:  # 最后一个账号仍然无法离线下载
                     print_info = f'{mag_url_simple}所有帳號均離線下載失敗！可能是所有帳號免費離線次數用盡，或者檔案大小超過雲端硬碟剩餘容量！'
-                    context.bot.send_message(chat_id=update.effective_chat.id, text=print_info)
+                    safe_send_message(print_info)
                     logging.warning(print_info)
                     record_batch_result(batch_id, 'fail', mag_url_simple, "所有帳號離線失敗", update, context)
                     return
@@ -500,7 +712,7 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None, ba
                             file_id = each_down['file_id']
                             # 输出信息
                             print_info = f'帳號{each_account}離線下載磁力已完成：\n{mag_url_simple}\n檔案名稱：{mag_name}'
-                            context.bot.send_message(chat_id=update.effective_chat.id, text=print_info)
+                            safe_send_message(print_info)
                             logging.info(print_info)
                         elif each_down['progress'] == 100:  # 可能存在错误但还是允许推送aria2下载了
                             done = True
@@ -508,7 +720,7 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None, ba
                             # 输出信息
                             print_info = f'帳號{each_account}離線下載磁力已完成:\n{mag_url_simple}\n但含有錯誤訊息：' \
                                          f'{each_down["message"].strip()}！\n檔案名稱：{mag_name}'
-                            context.bot.send_message(chat_id=update.effective_chat.id, text=print_info)
+                            safe_send_message(print_info)
                             logging.warning(print_info)
                         else:
                             logging.info(
@@ -522,7 +734,7 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None, ba
                     not_found_count += 1
                     if not_found_count >= 5:
                         print_info = f'帳號{each_account}離線下載{mag_url_simple}的任務被取消（或多次查詢未找到）！'
-                        context.bot.send_message(chat_id=update.effective_chat.id, text=print_info)
+                        safe_send_message(print_info)
                         logging.warning(print_info)
                         break
                     else:
@@ -539,7 +751,7 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None, ba
                 break
             elif find and not done:
                 print_info = f'帳號{each_account}離線下載{mag_url_simple}的任務超時（1小時）！已取消該任務！'
-                context.bot.send_message(chat_id=update.effective_chat.id, text=print_info)
+                safe_send_message(print_info)
                 logging.warning(print_info)
                 record_batch_result(batch_id, 'fail', mag_name if mag_name else mag_url_simple, "離線下載超時", update, context)
                 return
@@ -581,7 +793,7 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None, ba
                             continue
                     if not push_flag:  # 5次都推送下载失败，让用户手动下载该文件，并且要检查网络！
                         print_info = f'{name}推送aria2下載失敗！該檔案直連如下，請手動下載：\n{url}'
-                        context.bot.send_message(chat_id=update.effective_chat.id, text=print_info)
+                        safe_send_message(print_info)
                         logging.error(print_info)
                         continue  # 这个文件让用户手动下载，程序处理下一个文件
 
@@ -590,8 +802,7 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None, ba
                     logging.info(f'{path}{name}推送aria2下載')
 
                 # 文件夹所有文件都推送完后再发送信息，避免消息过多
-                context.bot.send_message(chat_id=update.effective_chat.id,
-                                         text=f'資料夾已推送aria2下載：\n{down_name}\n請耐心等待...')
+                safe_send_message(f'資料夾已推送aria2下載：\n{down_name}\n請耐心等待...')
                 logging.info(f'{down_name}資料夾下所有檔案已推送aria2下載，請耐心等待...')
 
             # 否则是单个文件，只推送一次，不用太担心网络请求出错
@@ -602,11 +813,36 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None, ba
                                       'params': [f"token:{ARIA2_SECRET}", [down_url],
                                                  {"dir": ARIA2_DOWNLOAD_PATH, "out": down_name,
                                                   "header": download_headers}]})
-                response = requests.post(f'{SCHEMA}://{ARIA2_HOST}:{ARIA2_PORT}/jsonrpc', data=jsonreq,
-                                         timeout=5).json()
+                
+                push_flag = False
+                for tries in range(5):
+                    try:
+                        response = requests.post(f'{SCHEMA}://{ARIA2_HOST}:{ARIA2_PORT}/jsonrpc', data=jsonreq,
+                                                 timeout=5).json()
+                        push_flag = True
+                        break
+                    except requests.exceptions.ReadTimeout:
+                        logging.warning(f'{down_name}第{tries + 1}(/5)次推送aria2下載超時，將重試！')
+                        continue
+                    except json.JSONDecodeError:
+                        logging.warning(f'{down_name}第{tries + 1}(/5)次推送aria2下載出錯，可能是frp故障，將重試！')
+                        sleep(5)
+                        continue
+                    except Exception as e:
+                        logging.warning(f'{down_name}第{tries + 1}(/5)次推送aria2下載發生未知錯誤: {e}，將重試！')
+                        sleep(2)
+                        continue
+
+                if not push_flag:
+                    print_info = f'{down_name}推送aria2下載失敗（多次重試無效）！該檔案直連如下，請手動下載：\n{down_url}'
+                    safe_send_message(print_info)
+                    logging.error(print_info)
+                    # 這裡應該要標記失敗並返回，或者讓它進入失敗邏輯
+                    record_batch_result(batch_id, 'fail', down_name, "推送Aria2失敗", update, context)
+                    return 
+
                 gid[response['result']] = [down_name, file_id, down_url]
-                context.bot.send_message(chat_id=update.effective_chat.id,
-                                         text=f'檔案已推送aria2下載：\n{down_name}\n請耐心等待...')
+                safe_send_message(f'檔案已推送aria2下載：\n{down_name}\n請耐心等待...')
                 logging.info(f'{down_name}已推送aria2下載，請耐心等待...')
 
             logging.info(f'睡眠30s，之後將開始查詢{down_name}下載進度...')
@@ -670,7 +906,7 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None, ba
                                         continue
                                 if not repush_flag:  # ?次重新推送失败，则认为此文件下载失败，让用户手动下载
                                     print_info = f'{retry_down_name}下載異常後重新推送失敗！該檔案直連如下，請手動下載：\n{retry_the_url}'
-                                    context.bot.send_message(chat_id=update.effective_chat.id, text=print_info)
+                                    safe_send_message(print_info)
                                     logging.error(print_info)
                                     failed_gid[each_gid] = temp_gid.pop(each_gid)  # 5次都不成功，别管这个任务了，放弃吧没救了
                                     continue  # 程序将查询下一个gid
@@ -686,13 +922,12 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None, ba
                             else:
                                 print_info = f'aria2下載{gid[each_gid][0]}出錯！錯誤訊息：{error_message}\t該檔案直連如下，' \
                                              f'請手動下載並反饋bug：\n{gid[each_gid][2]}'
-                                context.bot.send_message(chat_id=update.effective_chat.id, text=print_info)
+                                safe_send_message(print_info)
                                 logging.warning(print_info)
                                 failed_gid[each_gid] = temp_gid.pop(each_gid)  # 认为该任务失败
 
                     except KeyError:  # 此时任务可能已被手动删除
-                        context.bot.send_message(chat_id=update.effective_chat.id,
-                                                 text=f'aria2下載{gid[each_gid][0]}任務被刪除！')
+                        safe_send_message(f'aria2下載{gid[each_gid][0]}任務被刪除！')
                         logging.warning(f'aria2下載{gid[each_gid][0]}任務被刪除！')
                         failed_gid[each_gid] = temp_gid.pop(each_gid)  # 认为该任务失败
 
@@ -738,14 +973,13 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None, ba
                         else:
                             print_info += f'帳號{each_account}中下載成功的雲端硬碟檔案刪除失敗，請手動刪除\n'
 
-                        context.bot.send_message(chat_id=update.effective_chat.id, text=print_info)
+                        safe_send_message(print_info)
                         logging.info(print_info)
 
                         # /download命令仅打算临时解决问题，当/pikpak命令足够健壮后将弃用/download命令
                         print_info = f'對於下載失敗的檔案可使用指令：\n`/clean {each_account}`清空此帳號下所有檔案\n~~或者使用臨時指令：~~' \
                                      f'\n~~`/download {each_account}`重試下載此帳號下所有檔案~~'
-                        context.bot.send_message(chat_id=update.effective_chat.id, text=print_info,
-                                                 parse_mode='Markdown')
+                        safe_send_message(print_info, parse_mode='Markdown')
                         logging.info(print_info)
                         # 記錄批量失敗
                         record_batch_result(batch_id, 'fail', down_name, f"部分檔案下載失敗: {len(failed_gid)}個", update, context)
@@ -775,7 +1009,7 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None, ba
                         else:
                             print_info += f'\n帳號{each_account}中該檔案的雲端硬碟空間釋放失敗，請手動刪除'
                         # 发送下载结果统计信息
-                        context.bot.send_message(chat_id=update.effective_chat.id, text=print_info)
+                        safe_send_message(print_info)
                         logging.info(print_info)
                         
                         # 記錄批量成功
@@ -786,7 +1020,7 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None, ba
 
     except requests.exceptions.ReadTimeout:
         print_info = f'下載磁力{mag_url_simple}時網路請求超時！可稍後重試`/pikpak {mag_url_simple}`'
-        context.bot.send_message(chat_id=update.effective_chat.id, text=print_info, parse_mode='Markdown')
+        safe_send_message(print_info, parse_mode='Markdown')
         logging.error(print_info)
         record_batch_result(batch_id, 'fail', mag_url_simple, "網路請求超時", update, context)
     except Exception as e:
@@ -836,7 +1070,7 @@ def pikpak(update: Update, context: CallbackContext):
 
             # 显示信息为了简洁，仅提取磁链中xt参数部分
             mag_url_part = re.search(r'^(magnet:\?).*(xt=.+?)(&|$)', each_magnet)
-            if mag_url_part:  # 正则匹配上，则输出信息
+            if mag_url_part:  # 正则匹配上，則输出信息
                 print_info += ''.join(mag_url_part.groups()[:-1])
             else:  # 否则输出未识别信息
                 print_info += each_magnet
@@ -1166,6 +1400,13 @@ dispatcher.add_handler(magnet_handler)
 dispatcher.add_handler(pikpak_handler)
 dispatcher.add_handler(clean_handler)
 dispatcher.add_handler(path_handler)
+
+# 啟動 Web UI 線程
+flask_thread = threading.Thread(target=run_flask)
+flask_thread.daemon = True
+flask_thread.start()
+
+logging.info("Web UI 已啟動，請訪問 http://localhost:5000")
 
 updater.start_polling()
 updater.idle()
