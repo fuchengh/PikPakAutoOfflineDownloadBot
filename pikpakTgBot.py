@@ -174,20 +174,23 @@ def api_stats():
             # 如果 get_offline_list 失敗，不會影響 Aria2 的顯示
             pikpak_tasks = get_offline_list(USER[0])
             for task in pikpak_tasks:
-                # 只顯示未完成的，或者剛完成但還沒被清理的
                 # PikPak 的 status: PHASE_TYPE_RUNNING, PHASE_TYPE_COMPLETE, PHASE_TYPE_ERROR
                 phase = task.get('phase')
                 progress = int(task.get('progress', 0))
-                
+                error_msg = task.get('message', '')
+
+                # 1. 忽略離線完成且進度 100% 的任務，避免 Dashboard 過於擁擠
                 if phase == 'PHASE_TYPE_COMPLETE' and progress == 100:
-                     # 已完成但還沒被清理的，顯示為雲端完成
-                     status = 'cloud_complete'
-                elif phase == 'PHASE_TYPE_ERROR':
-                     status = 'cloud_error'
-                else:
-                     status = 'cloud_downloading'
+                    continue
                 
-                # 如果是已完成且很久之前的任務，可能不需要顯示，但這裡先全部顯示，前端過濾
+                # 2. 忽略 "file deleted" 錯誤 (正常情況)
+                if phase == 'PHASE_TYPE_ERROR':
+                    if "file deleted" in error_msg.lower() or "file_deleted" in error_msg.lower():
+                        continue
+                    status = 'cloud_error'
+                else:
+                    # 顯示正在離線下載中或其他非錯誤狀態
+                    status = 'cloud_downloading'
                 
                 tasks.append({
                     'type': 'pikpak',
@@ -198,7 +201,7 @@ def api_stats():
                     'completed': int(task.get('file_size', 0)) * progress // 100,
                     'speed': 0, # PikPak API 通常不返回即時速度
                     'progress': progress,
-                    'error': task.get('message', '') if phase == 'PHASE_TYPE_ERROR' else ''
+                    'error': error_msg if phase == 'PHASE_TYPE_ERROR' else ''
                 })
     except Exception as e:
         # logging.error(f"PikPak Stats Error: {e}") # 降低日誌級別或暫時忽略，避免刷屏
@@ -738,7 +741,15 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None, ba
                         if each_down['id'] == mag_id:  # 匹配上任务id就是找到了
                             find = True
                             not_found_count = 0
-                            if each_down['progress'] == 100 and each_down['message'] == 'Saved':  # 查看完成了吗
+                            
+                            # 檢查是否已刪除 (點 2)
+                            msg = each_down.get('message', '')
+                            if "file deleted" in msg.lower() or "file_deleted" in msg.lower():
+                                logging.info(f"帳號{each_account}離線任務 {mag_name} 檔案已在雲端刪除，跳過處理")
+                                find = False # 視為未找到，這將導致 main 返回而不進行後續下載
+                                break
+
+                            if each_down['progress'] == 100 and msg == 'Saved':  # 查看完成了吗
                                 done = True
                                 file_id = each_down['file_id']
                                 # 输出信息
@@ -749,8 +760,8 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None, ba
                                 done = True
                                 file_id = each_down['file_id']
                                 # 输出信息
-                                print_info = f'帳號{each_account}離線下載磁力已完成:\n{mag_url_simple}\n但含有錯誤訊息：' \
-                                             f'{each_down["message"].strip()}！\n檔案名稱：{mag_name}'
+                                print_info = f'帳號{each_account}離線下載磁力已完成:\n{mag_url_simple}\n但含有訊息：' \
+                                             f'{msg.strip()}！\n檔案名稱：{mag_name}'
                                 safe_send_message(print_info)
                                 logging.warning(print_info)
                             else:
@@ -1445,10 +1456,13 @@ def startup_recovery():
                 # 注意：PikPak API 的 phase 可能是 PHASE_TYPE_RUNNING 或 PHASE_TYPE_COMPLETE
                 phase = task.get('phase')
                 progress = int(task.get('progress', 0))
+                message = task.get('message', '')
                 
-                # 如果是正在下載，或者已完成但還在列表裡（代表可能沒推送到 Aria2）
-                # 這裡有個潛在問題：如果任務真的完成了但沒刪除（因配置不刪除），重啟後會再次推送。
-                # 但這比丟失任務好。且 main 函數會檢查 Aria2 狀態，如果 Aria2 已經有了（同名），通常不會重複下載或會報錯跳過。
+                # 忽略已刪除的檔案 (點 2)
+                if "file deleted" in message.lower() or "file_deleted" in message.lower():
+                    continue
+                
+                # 篩選條件：狀態是正在下載 (RUNNING) 或 完成但未推送 (COMPLETE)
                 if phase == 'PHASE_TYPE_RUNNING' or (phase == 'PHASE_TYPE_COMPLETE' and progress == 100):
                     task_info = {
                         'id': task.get('id'),
