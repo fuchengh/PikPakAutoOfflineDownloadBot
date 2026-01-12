@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PikPak 下載助手</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8f9fa; padding-top: 20px; }
+        .log-container { 
+            background-color: #212529; 
+            color: #0f0; 
+            font-family: monospace; 
+            padding: 15px; 
+            border-radius: 5px; 
+            height: 400px; 
+            overflow-y: auto; 
+            font-size: 0.9rem;
+        }
+        .status-badge { font-size: 0.8em; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h2 class="mb-4">🚀 PikPak 自動下載助手</h2>
+    
+    <div class="card mb-4 shadow-sm">
+        <div class="card-header bg-primary text-white">
+            <h5 class="mb-0">新增磁力連結 (Add Magnet)</h5>
+        </div>
+        <div class="card-body">
+            <form id="magnetForm">
+                <div class="mb-3">
+                    <label for="magnets" class="form-label">請貼上磁力連結 (一行一個)</label>
+                    <textarea class="form-control" id="magnets" rows="5" placeholder="magnet:?xt=urn:btih:..."></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">🚀 提交下載</button>
+            </form>
+            <div id="resultMessage" class="mt-3"></div>
+        </div>
+    </div>
+
+    <div class="card shadow-sm">
+        <div class="card-header bg-dark text-white d-flex justify-content-between align-items-center">
+            <h5 class="mb-0">運行日誌 (Live Logs)</h5>
+            <button class="btn btn-sm btn-outline-light" onclick="fetchLogs()">刷新</button>
+        </div>
+        <div class="card-body bg-dark p-0">
+            <div id="logArea" class="log-container">載入中...</div>
+        </div>
+    </div>
+</div>
+
+<script>
+    document.getElementById('magnetForm').addEventListener('submit', async function(e) {
+        e.preventDefault();
+        const magnets = document.getElementById('magnets').value;
+        const btn = this.querySelector('button');
+        const msgDiv = document.getElementById('resultMessage');
+        
+        if (!magnets.trim()) return;
+
+        btn.disabled = true;
+        btn.innerHTML = '處理中...';
+        msgDiv.innerHTML = '';
+
+        try {
+            const response = await fetch('/api/add', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({magnets: magnets})
+            });
+            const data = await response.json();
+            
+            if (data.status === 'ok') {
+                msgDiv.innerHTML = `<div class="alert alert-success">✅ 已成功添加 ${data.count} 個任務！</div>`;
+                document.getElementById('magnets').value = '';
+                fetchLogs();
+            } else {
+                msgDiv.innerHTML = `<div class="alert alert-danger">❌ 錯誤: ${data.message}</div>`;
+            }
+        } catch (error) {
+            msgDiv.innerHTML = `<div class="alert alert-danger">❌ 請求失敗: ${error}</div>`;
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = '🚀 提交下載';
+        }
+    });
+
+    async function fetchLogs() {
+        try {
+            const response = await fetch('/api/logs');
+            const data = await response.json();
+            const logArea = document.getElementById('logArea');
+            logArea.innerHTML = data.logs.join('<br>');
+            logArea.scrollTop = logArea.scrollHeight;
+        } catch (e) {
+            console.error(e);
+        }
+    }
+
+    // Auto refresh logs every 3 seconds
+    setInterval(fetchLogs, 3000);
+    fetchLogs();
+</script>
+</body>
+</html>
