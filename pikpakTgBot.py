@@ -129,6 +129,68 @@ def api_add():
 def api_logs():
     return jsonify({'logs': log_buffer})
 
+def call_aria2(method, params=None):
+    """Helper to call Aria2 JSON-RPC"""
+    if params is None:
+        params = []
+    
+    payload = {
+        'jsonrpc': '2.0',
+        'id': 'webui',
+        'method': method,
+        'params': [f"token:{ARIA2_SECRET}"] + params
+    }
+    try:
+        response = requests.post(f'{SCHEMA}://{ARIA2_HOST}:{ARIA2_PORT}/jsonrpc', 
+                               json=payload, timeout=2).json()
+        return response.get('result', [])
+    except Exception as e:
+        return []
+
+@app.route('/api/stats')
+def api_stats():
+    # 獲取正在下載和等待中的任務
+    # 請求的欄位: gid, totalLength, completedLength, uploadLength, downloadSpeed, uploadSpeed, infoHash, numSeeders, seeder, status, errorCode, verifiedLength, verifyIntegrityPending
+    keys = ["gid", "status", "files", "totalLength", "completedLength", "downloadSpeed", "errorMessage"]
+    
+    try:
+        active = call_aria2('aria2.tellActive', [keys])
+        waiting = call_aria2('aria2.tellWaiting', [0, 100, keys]) # 取前100個等待中/暫停的
+        # stopped = call_aria2('aria2.tellStopped', [0, 10, keys]) # 也可以取已完成的，暫時先不用
+        
+        all_tasks = active + waiting
+        
+        # 簡單處理一下數據，方便前端顯示
+        processed_tasks = []
+        for task in all_tasks:
+            # 獲取文件名 (如果有的話)
+            name = "Unknown"
+            if task.get('files') and len(task['files']) > 0:
+                # 嘗試獲取路徑中的文件名
+                path = task['files'][0].get('path', '')
+                if path:
+                    name = os.path.basename(path)
+                else:
+                    # 如果沒有path (meta data階段), 嘗試用 uris
+                    uris = task['files'][0].get('uris', [])
+                    if uris:
+                        name = uris[0].get('uri', 'Unknown')
+
+            processed_tasks.append({
+                'gid': task.get('gid'),
+                'name': name,
+                'status': task.get('status'),
+                'total': int(task.get('totalLength', 0)),
+                'completed': int(task.get('completedLength', 0)),
+                'speed': int(task.get('downloadSpeed', 0)),
+                'error': task.get('errorMessage', '')
+            })
+            
+        return jsonify({'tasks': processed_tasks})
+    except Exception as e:
+        logging.error(f"API Stats Error: {e}")
+        return jsonify({'tasks': []})
+
 def run_flask():
     # 關閉 Flask 的啟動 banner
     cli = sys.modules['flask.cli']

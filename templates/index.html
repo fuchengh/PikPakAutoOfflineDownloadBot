@@ -5,53 +5,149 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PikPak 下載助手</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
     <style>
-        body { background-color: #f8f9fa; padding-top: 20px; }
+        body { background-color: #f0f2f5; padding-top: 20px; }
         .log-container { 
             background-color: #212529; 
-            color: #0f0; 
-            font-family: monospace; 
+            color: #4af626; 
+            font-family: 'Consolas', monospace; 
             padding: 15px; 
             border-radius: 5px; 
-            height: 400px; 
+            height: 500px; 
             overflow-y: auto; 
-            font-size: 0.9rem;
+            font-size: 0.85rem;
+            line-height: 1.4;
         }
-        .status-badge { font-size: 0.8em; }
+        .table-responsive { height: 500px; overflow-y: auto; }
+        .progress { height: 20px; background-color: #e9ecef; }
+        .status-active { color: #198754; font-weight: bold; }
+        .status-waiting { color: #ffc107; font-weight: bold; }
+        .status-paused { color: #6c757d; }
+        .status-error { color: #dc3545; font-weight: bold; }
     </style>
 </head>
 <body>
 <div class="container">
-    <h2 class="mb-4">🚀 PikPak 自動下載助手</h2>
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2 class="fw-bold text-primary">🚀 PikPak 下載助手</h2>
+        <span class="badge bg-secondary" id="connectionStatus">系統正常</span>
+    </div>
     
+    <!-- 提交區塊 -->
     <div class="card mb-4 shadow-sm">
         <div class="card-header bg-primary text-white">
-            <h5 class="mb-0">新增磁力連結 (Add Magnet)</h5>
+            <h5 class="mb-0">➕ 新增下載任務 (Add Magnet)</h5>
         </div>
         <div class="card-body">
             <form id="magnetForm">
                 <div class="mb-3">
-                    <label for="magnets" class="form-label">請貼上磁力連結 (一行一個)</label>
-                    <textarea class="form-control" id="magnets" rows="5" placeholder="magnet:?xt=urn:btih:..."></textarea>
+                    <textarea class="form-control" id="magnets" rows="3" placeholder="請貼上磁力連結 (一行一個)..."></textarea>
                 </div>
-                <button type="submit" class="btn btn-primary">🚀 提交下載</button>
+                <div class="d-flex justify-content-between align-items-center">
+                    <div id="resultMessage"></div>
+                    <button type="submit" class="btn btn-primary px-4">🚀 提交</button>
+                </div>
             </form>
-            <div id="resultMessage" class="mt-3"></div>
         </div>
     </div>
 
+    <!-- 監控區塊 -->
     <div class="card shadow-sm">
-        <div class="card-header bg-dark text-white d-flex justify-content-between align-items-center">
-            <h5 class="mb-0">運行日誌 (Live Logs)</h5>
-            <button class="btn btn-sm btn-outline-light" onclick="fetchLogs()">刷新</button>
+        <div class="card-header bg-white border-bottom-0">
+            <ul class="nav nav-tabs card-header-tabs" id="monitorTabs" role="tablist">
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link active" id="download-tab" data-bs-toggle="tab" data-bs-target="#download" type="button" role="tab">
+                        ⬇️ 下載狀態 (Aria2)
+                    </button>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="log-tab" data-bs-toggle="tab" data-bs-target="#log" type="button" role="tab">
+                        📝 系統日誌 (Logs)
+                    </button>
+                </li>
+            </ul>
         </div>
-        <div class="card-body bg-dark p-0">
-            <div id="logArea" class="log-container">載入中...</div>
+        <div class="card-body p-0">
+            <div class="tab-content" id="monitorTabsContent">
+                
+                <!-- Tab 1: 下載列表 -->
+                <div class="tab-pane fade show active" id="download" role="tabpanel">
+                    <div class="table-responsive p-3 bg-white">
+                        <table class="table table-hover align-middle">
+                            <thead class="table-light sticky-top">
+                                <tr>
+                                    <th style="width: 40%">檔案名稱</th>
+                                    <th style="width: 15%">狀態</th>
+                                    <th style="width: 20%">進度</th>
+                                    <th style="width: 15%">速度/大小</th>
+                                    <th style="width: 10%">剩餘時間</th>
+                                </tr>
+                            </thead>
+                            <tbody id="taskTableBody">
+                                <!-- JS 動態插入 -->
+                                <tr><td colspan="5" class="text-center text-muted">載入中...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Tab 2: 日誌 -->
+                <div class="tab-pane fade" id="log" role="tabpanel">
+                    <div id="logArea" class="log-container rounded-0 rounded-bottom">等待日誌...</div>
+                </div>
+            </div>
         </div>
     </div>
 </div>
 
 <script>
+    // --- 工具函數 ---
+    function formatBytes(bytes, decimals = 2) {
+        if (bytes === 0) return '0 B';
+        const k = 1024;
+        const dm = decimals < 0 ? 0 : decimals;
+        const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+    }
+
+    function formatTime(seconds) {
+        if (!isFinite(seconds) || seconds > 86400 * 30) return '--:--'; // Over 30 days
+        const h = Math.floor(seconds / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        const s = Math.floor(seconds % 60);
+        return [
+            h > 0 ? h : null,
+            m > 9 ? m : (h > 0 ? '0' + m : m),
+            s > 9 ? s : '0' + s
+        ].filter(a => a !== null).join(':');
+    }
+
+    function getStatusClass(status) {
+        switch(status) {
+            case 'active': return 'status-active';
+            case 'waiting': return 'status-waiting';
+            case 'paused': return 'status-paused';
+            case 'error': return 'status-error';
+            default: return '';
+        }
+    }
+
+    function getStatusText(status) {
+        switch(status) {
+            case 'active': return '下載中';
+            case 'waiting': return '等待中';
+            case 'paused': return '暫停';
+            case 'error': return '錯誤';
+            case 'complete': return '完成';
+            default: return status;
+        }
+    }
+
+    // --- 主邏輯 ---
+    
+    // 提交磁力連結
     document.getElementById('magnetForm').addEventListener('submit', async function(e) {
         e.preventDefault();
         const magnets = document.getElementById('magnets').value;
@@ -73,35 +169,105 @@
             const data = await response.json();
             
             if (data.status === 'ok') {
-                msgDiv.innerHTML = `<div class="alert alert-success">✅ 已成功添加 ${data.count} 個任務！</div>`;
+                msgDiv.innerHTML = `<span class="text-success fw-bold">✅ 已成功添加 ${data.count} 個任務！</span>`;
                 document.getElementById('magnets').value = '';
+                // 切換到日誌頁看處理進度
+                // var triggerEl = document.querySelector('#log-tab')
+                // bootstrap.Tab.getOrCreateInstance(triggerEl).show()
                 fetchLogs();
             } else {
-                msgDiv.innerHTML = `<div class="alert alert-danger">❌ 錯誤: ${data.message}</div>`;
+                msgDiv.innerHTML = `<span class="text-danger fw-bold">❌ 錯誤: ${data.message}</span>`;
             }
         } catch (error) {
-            msgDiv.innerHTML = `<div class="alert alert-danger">❌ 請求失敗: ${error}</div>`;
+            msgDiv.innerHTML = `<span class="text-danger fw-bold">❌ 請求失敗: ${error}</span>`;
         } finally {
             btn.disabled = false;
-            btn.innerHTML = '🚀 提交下載';
+            btn.innerHTML = '🚀 提交';
+            setTimeout(() => msgDiv.innerHTML = '', 5000);
         }
     });
 
+    // 獲取日誌
     async function fetchLogs() {
+        // 只有當 Tab 是 active 的時候才更新，節省資源
+        if (!document.getElementById('log').classList.contains('active')) return;
+
         try {
             const response = await fetch('/api/logs');
             const data = await response.json();
             const logArea = document.getElementById('logArea');
+            // 只在有變動時更新DOM? 簡單起見直接替換
             logArea.innerHTML = data.logs.join('<br>');
             logArea.scrollTop = logArea.scrollHeight;
         } catch (e) {
-            console.error(e);
+            console.error("Log fetch error", e);
         }
     }
 
-    // Auto refresh logs every 3 seconds
+    // 獲取任務列表
+    async function fetchTasks() {
+        // 只有當 Tab 是 active 的時候才更新
+        if (!document.getElementById('download').classList.contains('active')) return;
+
+        try {
+            const response = await fetch('/api/stats');
+            const data = await response.json();
+            const tbody = document.getElementById('taskTableBody');
+            
+            if (data.tasks.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted p-4">目前沒有正在進行的下載任務</td></tr>';
+                return;
+            }
+
+            const html = data.tasks.map(task => {
+                const percent = task.total > 0 ? (task.completed / task.total * 100).toFixed(1) : 0;
+                const eta = task.speed > 0 ? formatTime((task.total - task.completed) / task.speed) : '∞';
+                const statusClass = getStatusClass(task.status);
+                
+                return `
+                    <tr>
+                        <td>
+                            <div class="fw-bold text-truncate" style="max-width: 300px;" title="${task.name}">${task.name}</div>
+                            ${task.error ? `<div class="text-danger small">${task.error}</div>` : ''}
+                        </td>
+                        <td class="${statusClass}">${getStatusText(task.status)}</td>
+                        <td>
+                            <div class="d-flex align-items-center">
+                                <div class="progress flex-grow-1 me-2" style="height: 10px;">
+                                    <div class="progress-bar ${task.status === 'active' ? 'progress-bar-striped progress-bar-animated' : ''}" 
+                                         role="progressbar" 
+                                         style="width: ${percent}%"></div>
+                                </div>
+                                <span class="small text-muted">${percent}%</span>
+                            </div>
+                        </td>
+                        <td>
+                            <div class="fw-bold">${formatBytes(task.speed)}/s</div>
+                            <div class="small text-muted">${formatBytes(task.total)}</div>
+                        </td>
+                        <td class="text-muted font-monospace">${eta}</td>
+                    </tr>
+                `;
+            }).join('');
+            
+            tbody.innerHTML = html;
+            document.getElementById('connectionStatus').className = 'badge bg-success';
+            document.getElementById('connectionStatus').innerText = '連線正常';
+
+        } catch (e) {
+            console.error("Stats fetch error", e);
+            document.getElementById('connectionStatus').className = 'badge bg-danger';
+            document.getElementById('connectionStatus').innerText = '連線失敗';
+        }
+    }
+
+    // 定時任務
     setInterval(fetchLogs, 3000);
+    setInterval(fetchTasks, 2000);
+    
+    // 初始化
     fetchLogs();
+    fetchTasks();
 </script>
 </body>
 </html>
