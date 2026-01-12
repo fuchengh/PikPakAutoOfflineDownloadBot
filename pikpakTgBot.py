@@ -665,46 +665,51 @@ def main(update: Update, context: CallbackContext, magnet, offline_path=None, ba
             offline_start = time()  # 离线开始时间
             not_found_count = 0
             while (not done) and (time() - offline_start < 60 * 60):  # 1小时超时
-                temp = get_offline_list(each_account)  # 获取离线列表
-                find = False  # 离线列表中找到了任务id的标志
-                for each_down in temp:
-                    if each_down['id'] == mag_id:  # 匹配上任务id就是找到了
-                        find = True
-                        not_found_count = 0
-                        if each_down['progress'] == 100 and each_down['message'] == 'Saved':  # 查看完成了吗
-                            done = True
-                            file_id = each_down['file_id']
-                            # 输出信息
-                            print_info = f'帳號{each_account}離線下載磁力已完成：\n{mag_url_simple}\n檔案名稱：{mag_name}'
-                            safe_send_message(print_info)
-                            logging.info(print_info)
-                        elif each_down['progress'] == 100:  # 可能存在错误但还是允许推送aria2下载了
-                            done = True
-                            file_id = each_down['file_id']
-                            # 输出信息
-                            print_info = f'帳號{each_account}離線下載磁力已完成:\n{mag_url_simple}\n但含有錯誤訊息：' \
-                                         f'{each_down["message"].strip()}！\n檔案名稱：{mag_name}'
+                try:
+                    temp = get_offline_list(each_account)  # 获取离线列表
+                    find = False  # 离线列表中找到了任务id的标志
+                    for each_down in temp:
+                        if each_down['id'] == mag_id:  # 匹配上任务id就是找到了
+                            find = True
+                            not_found_count = 0
+                            if each_down['progress'] == 100 and each_down['message'] == 'Saved':  # 查看完成了吗
+                                done = True
+                                file_id = each_down['file_id']
+                                # 输出信息
+                                print_info = f'帳號{each_account}離線下載磁力已完成：\n{mag_url_simple}\n檔案名稱：{mag_name}'
+                                safe_send_message(print_info)
+                                logging.info(print_info)
+                            elif each_down['progress'] == 100:  # 可能存在错误但还是允许推送aria2下载了
+                                done = True
+                                file_id = each_down['file_id']
+                                # 输出信息
+                                print_info = f'帳號{each_account}離線下載磁力已完成:\n{mag_url_simple}\n但含有錯誤訊息：' \
+                                             f'{each_down["message"].strip()}！\n檔案名稱：{mag_name}'
+                                safe_send_message(print_info)
+                                logging.warning(print_info)
+                            else:
+                                logging.info(
+                                    f'帳號{each_account}離線下載{mag_url_simple}還未完成，進度{each_down["progress"]}'
+                                )
+                                sleep(10)
+                            # 只要找到了就可以退出查找循环
+                            break
+                    # 非正常退出查询离线完成方式
+                    if not find:  # 一轮下来没找到可能是删除或者添加失败等等异常
+                        not_found_count += 1
+                        if not_found_count >= 5:
+                            print_info = f'帳號{each_account}離線下載{mag_url_simple}的任務被取消（或多次查詢未找到）！'
                             safe_send_message(print_info)
                             logging.warning(print_info)
+                            break
                         else:
-                            logging.info(
-                                f'帳號{each_account}離線下載{mag_url_simple}還未完成，進度{each_down["progress"]}'
-                            )
-                            sleep(10)
-                        # 只要找到了就可以退出查找循环
-                        break
-                # 非正常退出查询离线完成方式
-                if not find:  # 一轮下来没找到可能是删除或者添加失败等等异常
-                    not_found_count += 1
-                    if not_found_count >= 5:
-                        print_info = f'帳號{each_account}離線下載{mag_url_simple}的任務被取消（或多次查詢未找到）！'
-                        safe_send_message(print_info)
-                        logging.warning(print_info)
-                        break
-                    else:
-                        logging.warning(f"帳號{each_account}未找到任務{mag_id}，重試({not_found_count}/5)...")
-                        sleep(5)
-                        continue
+                            logging.warning(f"帳號{each_account}未找到任務{mag_id}，重試({not_found_count}/5)...")
+                            sleep(5)
+                            continue
+                except Exception as e:
+                    logging.warning(f"監控離線下載進度時發生錯誤 (將自動重試): {e}")
+                    sleep(5)
+                    continue
 
             # 查询账号是否完成离线
             if (find and done) or (not find and not done):  # 前者找到离线任务并且完成了，后者是要么手动取消了要么卡在进度0
