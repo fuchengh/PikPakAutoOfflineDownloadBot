@@ -1352,7 +1352,7 @@ def account_manage(update: Update, context: CallbackContext):
 
 def path(update: Update, context: CallbackContext):
     """
-    设置网盘离线下载路径
+    設置網盤離線下載路徑
     :param update:
     :param context:
     :return:
