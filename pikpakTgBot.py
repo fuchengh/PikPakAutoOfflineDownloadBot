@@ -113,6 +113,12 @@ def api_add():
             
     logging.info(f"Web UI 收到 {len(magnets)} 個磁力下載請求")
 
+    # 通知 Telegram
+    try:
+        updater.bot.send_message(chat_id=ADMIN_IDS[0], text=f"📥 收到來自 Web UI 的 {len(magnets)} 個下載任務")
+    except Exception as e:
+        logging.error(f"Web UI 通知發送失敗: {e}")
+
     # 啟動下載線程
     global PIKPAK_OFFLINE_PATH
     offline_path = None
