@@ -10,11 +10,11 @@ PASSWORD = ["example_password1", "example_password2"]
 AUTO_DELETE = {}
 # 以下分别为aria2 RPC的协议（http/https）、host、端口、密钥
 ARIA2_HTTPS = False
-ARIA2_HOST = "example.aria2.host"
-ARIA2_PORT = "port"
-ARIA2_SECRET = "secret"
-# aria2下载根目录
-ARIA2_DOWNLOAD_PATH = "/mnt/sda1/aria2/pikpak"
+ARIA2_HOST = "aria2"
+ARIA2_PORT = "6800"
+ARIA2_SECRET = "pikpak_secret"
+# aria2下载根目录 (Docker 內部路徑)
+ARIA2_DOWNLOAD_PATH = "/downloads"
 # 可以自定义TG API，也可以保持默认
 TG_API_URL = 'https://api.telegram.org'
 
