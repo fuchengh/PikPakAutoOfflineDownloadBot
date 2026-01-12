@@ -668,37 +668,52 @@ def record_batch_result(batch_id, status, name, message, update, context):
 
 
 # /pikpak命令主程序
-def main(update: Update, context: CallbackContext, magnet, offline_path=None, batch_id=None):
+def main(update: Update, context: CallbackContext, magnet, offline_path=None, batch_id=None, resume_task=None, target_account=None):
     # 磁链的简化表示，不保证兼容所有磁链，仅为显示信息时比较简介，不影响任何实际功能
-    if str(magnet).startswith("magnet:?"):
+    mag_url_simple = magnet
+    if resume_task:
+        mag_url_simple = f"恢復任務: {resume_task.get('name', 'Unknown')}"
+    elif str(magnet).startswith("magnet:?"):
         mag_url_part = re.search(r'^(magnet:\?).*(xt=.+?)(&|$)', magnet)
         mag_url_simple = ''.join(mag_url_part.groups()[:-1])
-    else:
-        mag_url_simple = magnet
 
     # Helper function to safely send messages
     def safe_send_message(text, parse_mode=None):
-        if context and update and update.effective_chat:
-            try:
+        try:
+            if context and update and update.effective_chat:
                 context.bot.send_message(chat_id=update.effective_chat.id, text=text, parse_mode=parse_mode)
-            except Exception as e:
-                logging.error(f"Failed to send Telegram message: {e}")
+            else:
+                # Fallback for startup recovery or internal calls
+                if ADMIN_IDS:
+                    updater.bot.send_message(chat_id=ADMIN_IDS[0], text=text, parse_mode=parse_mode)
+        except Exception as e:
+            logging.error(f"Failed to send Telegram message: {e}")
 
     try:  # 捕捉所有的请求超时异常
         for each_account in USER:
+            # 如果是恢復模式，跳過非目標帳號
+            if resume_task and each_account != target_account:
+                continue
+
             # 离线下载并获取任务id和文件名
             mag_id, mag_name = None, None
-            for tries in range(3):
-                try:
-                    mag_id, mag_name = magnet_upload(magnet, each_account, offline_path=offline_path)
-                    if mag_id: # 成功獲取到ID
-                        break
-                except requests.exceptions.ReadTimeout:
-                    logging.warning(f"帳號{each_account}添加磁力鏈接超時，重試第{tries + 1}/3次...")
-                    sleep(2)
-                except Exception as e:
-                    logging.warning(f"帳號{each_account}添加磁力鏈接發生錯誤: {e}，重試第{tries + 1}/3次...")
-                    sleep(2)
+            
+            if resume_task:
+                mag_id = resume_task['id']
+                mag_name = resume_task['name']
+                logging.info(f"正在恢復帳號 {each_account} 的任務: {mag_name}")
+            else:
+                for tries in range(3):
+                    try:
+                        mag_id, mag_name = magnet_upload(magnet, each_account, offline_path=offline_path)
+                        if mag_id: # 成功獲取到ID
+                            break
+                    except requests.exceptions.ReadTimeout:
+                        logging.warning(f"帳號{each_account}添加磁力鏈接超時，重試第{tries + 1}/3次...")
+                        sleep(2)
+                    except Exception as e:
+                        logging.warning(f"帳號{each_account}添加磁力鏈接發生錯誤: {e}，重試第{tries + 1}/3次...")
+                        sleep(2)
 
             if not mag_id:  # 如果添加离线失败，那就试试下一个账号
                 if each_account == USER[-1]:  # 最后一个账号仍然无法离线下载
@@ -1416,6 +1431,44 @@ dispatcher.add_handler(magnet_handler)
 dispatcher.add_handler(pikpak_handler)
 dispatcher.add_handler(clean_handler)
 dispatcher.add_handler(path_handler)
+
+def startup_recovery():
+    """Bot 啟動時檢查是否有未完成的任務並恢復監控"""
+    logging.info("正在檢查是否有未完成的任務需要恢復...")
+    try:
+        for account in USER:
+            # 獲取該帳號的所有離線任務
+            tasks = get_offline_list(account)
+            resumed_count = 0
+            for task in tasks:
+                # 篩選條件：狀態是正在下載 (RUNNING) 或 完成但未推送 (COMPLETE)
+                # 注意：PikPak API 的 phase 可能是 PHASE_TYPE_RUNNING 或 PHASE_TYPE_COMPLETE
+                phase = task.get('phase')
+                progress = int(task.get('progress', 0))
+                
+                # 如果是正在下載，或者已完成但還在列表裡（代表可能沒推送到 Aria2）
+                # 這裡有個潛在問題：如果任務真的完成了但沒刪除（因配置不刪除），重啟後會再次推送。
+                # 但這比丟失任務好。且 main 函數會檢查 Aria2 狀態，如果 Aria2 已經有了（同名），通常不會重複下載或會報錯跳過。
+                if phase == 'PHASE_TYPE_RUNNING' or (phase == 'PHASE_TYPE_COMPLETE' and progress == 100):
+                    task_info = {
+                        'id': task.get('id'),
+                        'name': task.get('name') or task.get('file_name')
+                    }
+                    # 啟動恢復線程
+                    thread_list.append(threading.Thread(target=main, args=[None, None, None, None, None, task_info, account]))
+                    thread_list[-1].start()
+                    resumed_count += 1
+                    sleep(1) # 避免過快啟動
+            
+            if resumed_count > 0:
+                logging.info(f"已從帳號 {account} 恢復 {resumed_count} 個任務")
+    except Exception as e:
+        logging.error(f"啟動恢復任務失敗: {e}")
+
+# 啟動恢復線程
+recovery_thread = threading.Thread(target=startup_recovery)
+recovery_thread.daemon = True
+recovery_thread.start()
 
 # 啟動 Web UI 線程
 flask_thread = threading.Thread(target=run_flask)
