@@ -52,6 +52,43 @@
         </div>
     </div>
 
+    <!-- 重試卡住任務區塊 -->
+    <div class="card mb-4 shadow-sm">
+        <div class="card-header bg-warning text-dark d-flex justify-content-between align-items-center">
+            <h5 class="mb-0">🔄 重試卡住的任務 (Retry Stuck)</h5>
+            <span class="badge bg-dark" id="stuckCount">0 個卡住</span>
+        </div>
+        <div class="card-body">
+            <div class="row align-items-center">
+                <div class="col-md-4">
+                    <label class="form-label small text-muted">進度閾值 (只重試 >= 此進度的任務)</label>
+                    <div class="input-group">
+                        <input type="number" class="form-control" id="minProgress" value="90" min="0" max="100">
+                        <span class="input-group-text">%</span>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label small text-muted">選項</label>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="deleteCloud" checked>
+                        <label class="form-check-label small" for="deleteCloud">同時刪除雲端不完整檔案</label>
+                    </div>
+                </div>
+                <div class="col-md-4 text-end">
+                    <label class="form-label d-block">&nbsp;</label>
+                    <button class="btn btn-outline-secondary me-2" onclick="checkStuck()">🔍 檢查</button>
+                    <button class="btn btn-warning" onclick="retryStuck()">🔄 重試全部</button>
+                </div>
+            </div>
+            <div id="stuckList" class="mt-3" style="display: none;">
+                <hr>
+                <div class="small text-muted mb-2">卡住的任務：</div>
+                <ul id="stuckTaskList" class="list-group list-group-flush small"></ul>
+            </div>
+            <div id="retryResult" class="mt-2"></div>
+        </div>
+    </div>
+
     <!-- 監控區塊 -->
     <div class="card shadow-sm">
         <div class="card-header bg-white border-bottom-0">
@@ -277,13 +314,96 @@
         }
     }
 
+    // --- 重試卡住任務相關 ---
+    
+    // 檢查卡住的任務
+    async function checkStuck() {
+        const minProgress = document.getElementById('minProgress').value || 90;
+        const countBadge = document.getElementById('stuckCount');
+        const listDiv = document.getElementById('stuckList');
+        const taskList = document.getElementById('stuckTaskList');
+        
+        countBadge.innerText = '檢查中...';
+        
+        try {
+            const response = await fetch(`/api/stuck?min_progress=${minProgress}`);
+            const data = await response.json();
+            
+            countBadge.innerText = `${data.count} 個卡住`;
+            countBadge.className = data.count > 0 ? 'badge bg-danger' : 'badge bg-success';
+            
+            if (data.count > 0) {
+                listDiv.style.display = 'block';
+                taskList.innerHTML = data.tasks.map(t => 
+                    `<li class="list-group-item d-flex justify-content-between align-items-center py-1">
+                        <span class="text-truncate" style="max-width: 70%;" title="${t.name}">${t.name}</span>
+                        <span>
+                            <span class="badge bg-secondary me-1">${t.account.split('@')[0]}</span>
+                            <span class="badge bg-warning text-dark">${t.progress}%</span>
+                        </span>
+                    </li>`
+                ).join('');
+            } else {
+                listDiv.style.display = 'none';
+            }
+        } catch (e) {
+            console.error("Check stuck error", e);
+            countBadge.innerText = '檢查失敗';
+            countBadge.className = 'badge bg-danger';
+        }
+    }
+    
+    // 重試卡住的任務
+    async function retryStuck() {
+        const minProgress = parseInt(document.getElementById('minProgress').value) || 90;
+        const deleteCloud = document.getElementById('deleteCloud').checked;
+        const resultDiv = document.getElementById('retryResult');
+        
+        if (!confirm(`確定要重試所有進度 >= ${minProgress}% 的卡住任務嗎？\n\n這會刪除雲端不完整的檔案並重新開始離線下載。`)) {
+            return;
+        }
+        
+        resultDiv.innerHTML = '<span class="text-muted">處理中...</span>';
+        
+        try {
+            const response = await fetch('/api/retry', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    min_progress: minProgress,
+                    delete_cloud: deleteCloud
+                })
+            });
+            const data = await response.json();
+            
+            if (data.success + data.fail === 0) {
+                resultDiv.innerHTML = '<span class="text-success">✅ 沒有找到卡住的任務</span>';
+            } else {
+                resultDiv.innerHTML = `
+                    <span class="text-success">✅ 成功: ${data.success}</span>
+                    ${data.fail > 0 ? `<span class="text-danger ms-2">❌ 失敗: ${data.fail}</span>` : ''}
+                `;
+            }
+            
+            // 刷新列表
+            setTimeout(checkStuck, 1000);
+            setTimeout(() => resultDiv.innerHTML = '', 5000);
+            
+        } catch (e) {
+            console.error("Retry error", e);
+            resultDiv.innerHTML = '<span class="text-danger">❌ 重試失敗</span>';
+        }
+    }
+    
     // 定時任務
     setInterval(fetchLogs, 3000);
     setInterval(fetchTasks, 2000);
+    setInterval(checkStuck, 30000); // 每 30 秒檢查一次卡住的任務
     
     // 初始化
     fetchLogs();
     fetchTasks();
+    checkStuck();
 </script>
 </body>
 </html>

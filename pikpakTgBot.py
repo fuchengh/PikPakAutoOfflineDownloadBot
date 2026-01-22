@@ -245,6 +245,59 @@ def api_stats():
 
     return jsonify({'tasks': tasks})
 
+@app.route('/api/stuck')
+def api_stuck():
+    """獲取卡住的任務列表"""
+    min_progress = request.args.get('min_progress', 90, type=int)
+    
+    all_stuck = []
+    for account in USER:
+        stuck = get_stuck_tasks(account, min_progress)
+        for task in stuck:
+            task['account'] = account
+            all_stuck.append(task)
+    
+    return jsonify({'tasks': all_stuck, 'count': len(all_stuck)})
+
+@app.route('/api/retry', methods=['POST'])
+def api_retry():
+    """重試卡住的任務"""
+    data = request.json or {}
+    min_progress = data.get('min_progress', 90)
+    delete_cloud = data.get('delete_cloud', True)
+    
+    logging.info(f"Web UI 觸發重試卡住任務 (進度 >= {min_progress}%)")
+    
+    total_success = 0
+    total_fail = 0
+    all_results = []
+    
+    for account in USER:
+        success, fail, results = retry_stuck_tasks(account, min_progress, delete_cloud_files=delete_cloud)
+        total_success += success
+        total_fail += fail
+        if results:
+            for r in results:
+                r['account'] = account
+            all_results.extend(results)
+    
+    # 通知 Telegram
+    if total_success + total_fail > 0:
+        try:
+            msg = f"🔄 Web UI 觸發重試卡住任務\n"
+            msg += f"✅ 成功: {total_success}\n"
+            msg += f"❌ 失敗: {total_fail}"
+            updater.bot.send_message(chat_id=ADMIN_IDS[0], text=msg)
+        except Exception as e:
+            logging.error(f"通知發送失敗: {e}")
+    
+    return jsonify({
+        'status': 'ok',
+        'success': total_success,
+        'fail': total_fail,
+        'results': all_results
+    })
+
 def run_flask():
     # 關閉 Flask 的啟動 banner
     cli = sys.modules['flask.cli']
@@ -308,7 +361,8 @@ def start(update: Update, context: CallbackContext):
                                   "/p\t自動離線+aria2下載+釋放雲端硬碟空間\n" 
                                   "/account\t管理帳號（發送/account查看使用說明）\n" 
                                   "/clean\t清空帳號雲端硬碟空間（請慎用，清空檔案無法找回！）\n" 
-                                  "/path\t管理pikpak離線下載的路徑\n")
+                                  "/path\t管理pikpak離線下載的路徑\n"
+                                  "/retry\t重試卡住的離線任務（發送/retry查看使用說明）\n")
 
 
 # 账号密码登录
@@ -622,6 +676,175 @@ def delete_trash(file_id, account, mode='normal'):
             return False
 
     return True
+
+
+# 重試離線下載任務 (使用 PikPak API 的 retry 功能)
+def retry_offline_task(task_id, account):
+    """
+    使用 PikPak 的 RETRY 功能重新開始離線任務
+    這會讓 PikPak 重新嘗試下載，不需要原始 magnet link
+    """
+    login_headers = get_headers(account)
+    retry_url = f"{PIKPAK_API_URL}/drive/v1/task"
+    retry_data = {
+        "type": "offline",
+        "create_type": "RETRY",
+        "id": task_id,
+    }
+    
+    try:
+        result = requests.post(url=retry_url, headers=login_headers, json=retry_data, timeout=10).json()
+        
+        if "error" in result:
+            if result['error_code'] == 16:
+                logging.info(f"帳號{account}登入過期，正在重新登入")
+                login(account)
+                login_headers = get_headers(account)
+                result = requests.post(url=retry_url, headers=login_headers, json=retry_data, timeout=10).json()
+            else:
+                logging.error(f"帳號{account}重試任務失敗: {result.get('error_description', result)}")
+                return False, result.get('error_description', 'Unknown error')
+        
+        logging.info(f"帳號{account}成功重試任務 {task_id}")
+        return True, result
+    except Exception as e:
+        logging.error(f"帳號{account}重試任務時發生錯誤: {e}")
+        return False, str(e)
+
+
+# 刪除離線任務 (可選擇是否同時刪除雲端檔案)
+def delete_offline_task(task_ids, account, delete_files=False):
+    """
+    刪除離線任務
+    task_ids: 單個 task_id 或 list of task_ids
+    delete_files: 是否同時刪除雲端檔案
+    """
+    login_headers = get_headers(account)
+    delete_url = f"{PIKPAK_API_URL}/drive/v1/tasks"
+    
+    if isinstance(task_ids, str):
+        task_ids = [task_ids]
+    
+    params = {
+        "task_ids": ",".join(task_ids),
+        "delete_files": "true" if delete_files else "false",
+    }
+    
+    try:
+        result = requests.delete(url=delete_url, headers=login_headers, params=params, timeout=10)
+        
+        if result.status_code == 200:
+            logging.info(f"帳號{account}成功刪除 {len(task_ids)} 個任務")
+            return True, None
+        else:
+            error_msg = result.text
+            logging.error(f"帳號{account}刪除任務失敗: {error_msg}")
+            return False, error_msg
+    except Exception as e:
+        logging.error(f"帳號{account}刪除任務時發生錯誤: {e}")
+        return False, str(e)
+
+
+# 獲取卡住的任務 (進度達到指定值但未完成)
+def get_stuck_tasks(account, min_progress=90):
+    """
+    獲取卡住的離線任務
+    min_progress: 最小進度閾值，預設 90%
+    返回: [(task_id, task_name, progress, file_id), ...]
+    """
+    tasks = get_offline_list(account)
+    stuck = []
+    
+    for task in tasks:
+        phase = task.get('phase', '')
+        progress = int(task.get('progress', 0))
+        message = task.get('message', '')
+        
+        # 忽略已完成或已刪除的
+        if phase == 'PHASE_TYPE_COMPLETE' and progress == 100:
+            continue
+        if "file deleted" in message.lower() or "file_deleted" in message.lower():
+            continue
+        
+        # 篩選卡住的任務 (進度 >= min_progress 但未完成)
+        if progress >= min_progress and phase == 'PHASE_TYPE_RUNNING':
+            stuck.append({
+                'id': task.get('id'),
+                'name': task.get('name') or task.get('file_name') or 'Unknown',
+                'progress': progress,
+                'file_id': task.get('file_id'),
+            })
+    
+    return stuck
+
+
+# 重試卡住的任務
+def retry_stuck_tasks(account, min_progress=90, delete_cloud_files=True):
+    """
+    找出並重試卡住的任務
+    1. 找出進度 >= min_progress 但未完成的任務
+    2. 刪除這些任務的雲端檔案 (可選)
+    3. 使用 PikPak 的 RETRY 功能重新開始
+    
+    返回: (success_count, fail_count, results)
+    """
+    stuck_tasks = get_stuck_tasks(account, min_progress)
+    
+    if not stuck_tasks:
+        logging.info(f"帳號{account}沒有找到卡住的任務 (進度 >= {min_progress}%)")
+        return 0, 0, []
+    
+    logging.info(f"🔄 帳號{account}找到 {len(stuck_tasks)} 個卡住的任務 (進度 >= {min_progress}%)")
+    
+    results = []
+    success_count = 0
+    fail_count = 0
+    total = len(stuck_tasks)
+    
+    for i, task in enumerate(stuck_tasks, 1):
+        task_id = task['id']
+        task_name = task['name']
+        file_id = task.get('file_id')
+        progress = task['progress']
+        
+        logging.info(f"[{i}/{total}] 正在處理: {task_name} ({progress}%)")
+        
+        # Step 1: 刪除雲端檔案 (如果有且啟用)
+        if delete_cloud_files and file_id:
+            try:
+                delete_files(file_id, account, mode='force')
+                delete_trash(file_id, account, mode='force')
+                logging.info(f"  ↳ 已刪除雲端不完整檔案")
+            except Exception as e:
+                logging.warning(f"  ↳ 刪除雲端檔案失敗 (繼續重試): {e}")
+        
+        # Step 2: 使用 PikPak retry
+        success, result = retry_offline_task(task_id, account)
+        
+        if success:
+            success_count += 1
+            logging.info(f"  ↳ ✅ 已重新加入佇列")
+            results.append({
+                'name': task_name,
+                'progress': progress,
+                'status': 'success',
+                'message': '已重新加入佇列'
+            })
+        else:
+            fail_count += 1
+            logging.error(f"  ↳ ❌ 重試失敗: {result}")
+            results.append({
+                'name': task_name,
+                'progress': progress,
+                'status': 'fail',
+                'message': str(result)
+            })
+        
+        sleep(1)  # 避免請求過於頻繁
+    
+    logging.info(f"✅ 帳號{account}重試完成: 成功 {success_count}, 失敗 {fail_count}")
+    return success_count, fail_count, results
+
 
 # 記錄批量任務結果並發送匯總
 def record_batch_result(batch_id, status, name, message, update, context):
@@ -1428,11 +1651,113 @@ def path(update: Update, context: CallbackContext):
         context.bot.send_message(chat_id=update.effective_chat.id, text=f'已設置離線下載路徑：`{PIKPAK_OFFLINE_PATH}`', parse_mode='Markdown')
 
 
+def retry(update: Update, context: CallbackContext):
+    """重試卡住的離線下載任務"""
+    argv = context.args
+    
+    # 預設進度閾值
+    min_progress = 90
+    
+    # 解析參數
+    if len(argv) >= 1:
+        try:
+            min_progress = int(argv[0])
+            if min_progress < 0 or min_progress > 100:
+                context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text='進度閾值必須在 0-100 之間'
+                )
+                return
+        except ValueError:
+            if argv[0] not in ['list', 'l']:
+                context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text='【用法】\n'
+                         '查看卡住的任務：`/retry list` 或 `/retry l`\n'
+                         '重試卡住的任務：`/retry [進度閾值]`\n'
+                         '【範例】\n'
+                         '`/retry` - 重試進度 >= 90% 的任務\n'
+                         '`/retry 99` - 重試進度 >= 99% 的任務\n'
+                         '`/retry list` - 列出所有卡住的任務',
+                    parse_mode='Markdown'
+                )
+                return
+    
+    # 處理 list 命令
+    if len(argv) >= 1 and argv[0] in ['list', 'l']:
+        list_min_progress = int(argv[1]) if len(argv) >= 2 else 90
+        msg = f"📋 <b>卡住的任務列表</b> (進度 >= {list_min_progress}%)\n"
+        msg += "─" * 25 + "\n"
+        
+        total_stuck = 0
+        for account in USER:
+            stuck = get_stuck_tasks(account, list_min_progress)
+            if stuck:
+                msg += f"\n<b>帳號: {account}</b>\n"
+                for task in stuck:
+                    msg += f"  • {task['name']} ({task['progress']}%)\n"
+                total_stuck += len(stuck)
+        
+        if total_stuck == 0:
+            msg += f"\n✅ 沒有找到卡住的任務"
+        else:
+            msg += f"\n─" + "─" * 24 + "\n"
+            msg += f"共 {total_stuck} 個任務卡住"
+        
+        context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=msg,
+            parse_mode='HTML'
+        )
+        return
+    
+    # 執行重試
+    context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=f'🔄 正在查找並重試進度 >= {min_progress}% 的卡住任務...'
+    )
+    
+    total_success = 0
+    total_fail = 0
+    all_results = []
+    
+    for account in USER:
+        success, fail, results = retry_stuck_tasks(account, min_progress, delete_cloud_files=True)
+        total_success += success
+        total_fail += fail
+        if results:
+            all_results.append({'account': account, 'results': results})
+    
+    # 發送結果
+    if total_success + total_fail == 0:
+        context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f'✅ 沒有找到進度 >= {min_progress}% 的卡住任務'
+        )
+        return
+    
+    msg = f"📋 <b>重試結果</b>\n"
+    msg += f"✅ 成功: {total_success}  ❌ 失敗: {total_fail}\n"
+    
+    # 只列出任務名稱（簡潔版）
+    for item in all_results:
+        for r in item['results']:
+            icon = "✅" if r['status'] == 'success' else "❌"
+            msg += f"{icon} {r['name']}\n"
+    
+    context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=msg,
+        parse_mode='HTML'
+    )
+
+
 start_handler = CommandHandler(['start', 'help'], start)
 pikpak_handler = CommandHandler('p', pikpak)
 clean_handler = CommandHandler(['clean', 'clear'], clean)
 account_handler = CommandHandler('account', account_manage)
 path_handler = CommandHandler('path', path)
+retry_handler = CommandHandler('retry', retry)
 magnet_handler = MessageHandler(Filters.regex('^magnet:\?xt=urn:btih:[0-9a-fA-F]{40,}.*$'), pikpak)
 
 dispatcher.add_handler(AdminHandler())
@@ -1442,6 +1767,7 @@ dispatcher.add_handler(magnet_handler)
 dispatcher.add_handler(pikpak_handler)
 dispatcher.add_handler(clean_handler)
 dispatcher.add_handler(path_handler)
+dispatcher.add_handler(retry_handler)
 
 def startup_recovery():
     """Bot 啟動時檢查是否有未完成的任務並恢復監控"""
