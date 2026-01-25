@@ -89,6 +89,39 @@
         </div>
     </div>
 
+    <!-- 清理區塊 -->
+    <div class="card mb-4 shadow-sm">
+        <div class="card-header bg-danger text-white">
+            <h5 class="mb-0">🧹 清理雲端 (Clean)</h5>
+        </div>
+        <div class="card-body">
+            <div class="row align-items-center">
+                <div class="col-md-8">
+                    <div class="small text-muted mb-2">選擇清理模式：</div>
+                    <div class="btn-group" role="group">
+                        <input type="radio" class="btn-check" name="cleanMode" id="cleanAll" value="all" checked>
+                        <label class="btn btn-outline-secondary" for="cleanAll">標準清理</label>
+                        
+                        <input type="radio" class="btn-check" name="cleanMode" id="cleanDeep" value="deep">
+                        <label class="btn btn-outline-danger" for="cleanDeep">深度清理</label>
+                        
+                        <input type="radio" class="btn-check" name="cleanMode" id="cleanTasks" value="tasks_error">
+                        <label class="btn btn-outline-warning" for="cleanTasks">只清任務記錄</label>
+                    </div>
+                    <div class="small text-muted mt-2">
+                        <strong>標準清理</strong>: 刪除檔案 + 清理失敗的任務記錄<br>
+                        <strong>深度清理</strong>: 刪除檔案 + 清空回收站 + 清理所有任務記錄<br>
+                        <strong>只清任務記錄</strong>: 只清理失敗的離線任務記錄（不刪檔案）
+                    </div>
+                </div>
+                <div class="col-md-4 text-end">
+                    <button class="btn btn-danger" onclick="cleanCloud()">🧹 執行清理</button>
+                </div>
+            </div>
+            <div id="cleanResult" class="mt-2"></div>
+        </div>
+    </div>
+
     <!-- 監控區塊 -->
     <div class="card shadow-sm">
         <div class="card-header bg-white border-bottom-0">
@@ -392,6 +425,52 @@
         } catch (e) {
             console.error("Retry error", e);
             resultDiv.innerHTML = '<span class="text-danger">❌ 重試失敗</span>';
+        }
+    }
+    
+    // 清理雲端
+    async function cleanCloud() {
+        const mode = document.querySelector('input[name="cleanMode"]:checked').value;
+        const resultDiv = document.getElementById('cleanResult');
+        
+        const modeText = {
+            'all': '標準清理（刪除檔案 + 清理失敗任務記錄）',
+            'deep': '深度清理（刪除檔案 + 清空回收站 + 清理所有任務記錄）',
+            'tasks_error': '只清理失敗的離線任務記錄'
+        };
+        
+        if (!confirm(`確定要執行「${modeText[mode]}」嗎？\n\n此操作無法復原！`)) {
+            return;
+        }
+        
+        resultDiv.innerHTML = '<span class="text-muted">清理中，請稍候...</span>';
+        
+        try {
+            const response = await fetch('/api/clean', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ mode: mode })
+            });
+            const data = await response.json();
+            
+            if (data.status === 'ok') {
+                let html = '<div class="text-success">✅ 清理完成</div><ul class="small mb-0">';
+                for (const r of data.results) {
+                    html += `<li><strong>${r.account.split('@')[0]}</strong>: ${r.actions.join(', ')}</li>`;
+                }
+                html += '</ul>';
+                resultDiv.innerHTML = html;
+            } else {
+                resultDiv.innerHTML = '<span class="text-danger">❌ 清理失敗</span>';
+            }
+            
+            // 刷新任務列表
+            setTimeout(fetchTasks, 1000);
+            setTimeout(() => resultDiv.innerHTML = '', 10000);
+            
+        } catch (e) {
+            console.error("Clean error", e);
+            resultDiv.innerHTML = '<span class="text-danger">❌ 清理失敗</span>';
         }
     }
     

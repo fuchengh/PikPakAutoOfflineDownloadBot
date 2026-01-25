@@ -298,6 +298,76 @@ def api_retry():
         'results': all_results
     })
 
+@app.route('/api/clean', methods=['POST'])
+def api_clean():
+    """清理雲端檔案和離線任務記錄"""
+    data = request.json or {}
+    mode = data.get('mode', 'all')  # all, deep, tasks, tasks_error
+    
+    logging.info(f"Web UI 觸發清理 (模式: {mode})")
+    
+    results = []
+    
+    for account in USER:
+        login(account)
+        account_result = {'account': account, 'actions': []}
+        
+        if mode == 'deep':
+            # 深度清理：檔案 + 回收站 + 所有離線任務記錄
+            all_file_id = list(get_folder_all(account))
+            if len(all_file_id) > 0:
+                delete_files(all_file_id, account, mode='all')
+                account_result['actions'].append(f"已刪除 {len(all_file_id)} 個檔案")
+            
+            if empty_trash(account):
+                account_result['actions'].append("回收站已清空")
+            
+            success, fail = delete_offline_tasks(account)
+            if success > 0:
+                account_result['actions'].append(f"已清理 {success} 個離線任務記錄")
+                
+        elif mode == 'tasks':
+            # 只清理所有離線任務記錄
+            success, fail = delete_offline_tasks(account)
+            if success > 0:
+                account_result['actions'].append(f"已清理 {success} 個離線任務記錄")
+                
+        elif mode == 'tasks_error':
+            # 只清理失敗的離線任務記錄
+            success, fail = delete_offline_tasks(account, phase_filter='PHASE_TYPE_ERROR')
+            if success > 0:
+                account_result['actions'].append(f"已清理 {success} 個失敗的離線任務記錄")
+                
+        else:  # all
+            # 標準清理：檔案 + 失敗的離線任務記錄
+            all_file_id = list(get_folder_all(account))
+            if len(all_file_id) > 0:
+                delete_files(all_file_id, account, mode='all')
+                delete_trash(all_file_id, account, mode='all')
+                account_result['actions'].append(f"已刪除 {len(all_file_id)} 個檔案")
+            
+            success, fail = delete_offline_tasks(account, phase_filter='PHASE_TYPE_ERROR')
+            if success > 0:
+                account_result['actions'].append(f"已清理 {success} 個失敗的離線任務記錄")
+        
+        if not account_result['actions']:
+            account_result['actions'].append("無需清理")
+        
+        results.append(account_result)
+    
+    # 通知 Telegram
+    try:
+        msg = f"🧹 Web UI 觸發清理 (模式: {mode})\n"
+        for r in results:
+            msg += f"\n{r['account'].split('@')[0]}:\n"
+            for action in r['actions']:
+                msg += f"  ✅ {action}\n"
+        updater.bot.send_message(chat_id=ADMIN_IDS[0], text=msg)
+    except Exception as e:
+        logging.error(f"通知發送失敗: {e}")
+    
+    return jsonify({'status': 'ok', 'results': results})
+
 def run_flask():
     # 關閉 Flask 的啟動 banner
     cli = sys.modules['flask.cli']
@@ -360,7 +430,7 @@ def start(update: Update, context: CallbackContext):
                              text="【指令簡介】\n" 
                                   "/p\t自動離線+aria2下載+釋放雲端硬碟空間\n" 
                                   "/account\t管理帳號（發送/account查看使用說明）\n" 
-                                  "/clean\t清空帳號雲端硬碟空間（請慎用，清空檔案無法找回！）\n" 
+                                  "/clean\t清空雲端硬碟+離線任務記錄（發送/clean查看使用說明）\n" 
                                   "/path\t管理pikpak離線下載的路徑\n"
                                   "/retry\t重試卡住的離線任務（發送/retry查看使用說明）\n")
 
@@ -678,6 +748,108 @@ def delete_trash(file_id, account, mode='normal'):
     return True
 
 
+# 刪除離線任務記錄 (不是刪除檔案，是刪除任務列表中的記錄)
+def delete_offline_tasks(account, task_ids=None, delete_files_too=False, phase_filter=None):
+    """
+    刪除離線任務記錄
+    account: 帳號
+    task_ids: 指定要刪除的任務 ID 列表，如果為 None 則根據 phase_filter 刪除
+    delete_files_too: 是否同時刪除雲端檔案
+    phase_filter: 篩選特定狀態的任務 (如 'PHASE_TYPE_ERROR')，None 表示全部
+    
+    返回: (success_count, fail_count)
+    """
+    login_headers = get_headers(account)
+    
+    # 如果沒有指定 task_ids，則獲取所有任務
+    if task_ids is None:
+        tasks = get_offline_list(account)
+        if phase_filter:
+            task_ids = [t['id'] for t in tasks if t.get('phase') == phase_filter]
+        else:
+            task_ids = [t['id'] for t in tasks]
+    
+    if not task_ids:
+        logging.info(f"帳號{account}沒有需要刪除的離線任務記錄")
+        return 0, 0
+    
+    logging.info(f"帳號{account}準備刪除 {len(task_ids)} 個離線任務記錄")
+    
+    # PikPak API 限制每次最多刪除 100 個任務，需要分批
+    success_count = 0
+    fail_count = 0
+    batch_size = 50
+    
+    for i in range(0, len(task_ids), batch_size):
+        batch = task_ids[i:i + batch_size]
+        
+        delete_url = f"{PIKPAK_API_URL}/drive/v1/tasks"
+        params = {
+            "task_ids": ",".join(batch),
+            "delete_files": "true" if delete_files_too else "false",
+        }
+        
+        try:
+            result = requests.delete(url=delete_url, headers=login_headers, params=params, timeout=15)
+            
+            if result.status_code == 200:
+                success_count += len(batch)
+                logging.info(f"帳號{account}成功刪除 {len(batch)} 個離線任務記錄")
+            else:
+                # 嘗試重新登入
+                if result.status_code == 401 or 'error_code' in result.text:
+                    logging.info(f"帳號{account}登入過期，正在重新登入")
+                    login(account)
+                    login_headers = get_headers(account)
+                    result = requests.delete(url=delete_url, headers=login_headers, params=params, timeout=15)
+                    if result.status_code == 200:
+                        success_count += len(batch)
+                        logging.info(f"帳號{account}重試後成功刪除 {len(batch)} 個離線任務記錄")
+                    else:
+                        fail_count += len(batch)
+                        logging.error(f"帳號{account}刪除離線任務記錄失敗: {result.text}")
+                else:
+                    fail_count += len(batch)
+                    logging.error(f"帳號{account}刪除離線任務記錄失敗: {result.text}")
+        except Exception as e:
+            fail_count += len(batch)
+            logging.error(f"帳號{account}刪除離線任務記錄時發生錯誤: {e}")
+        
+        sleep(1)  # 避免請求過於頻繁
+    
+    logging.info(f"帳號{account}離線任務記錄清理完成: 成功 {success_count}, 失敗 {fail_count}")
+    return success_count, fail_count
+
+
+# 清空回收站 (徹底清空，不是刪除指定檔案)
+def empty_trash(account):
+    """
+    清空回收站中的所有檔案
+    """
+    login_headers = get_headers(account)
+    empty_url = f"{PIKPAK_API_URL}/drive/v1/files/trash:empty"
+    
+    try:
+        result = requests.post(url=empty_url, headers=login_headers, json={}, timeout=15)
+        
+        if result.status_code == 200:
+            logging.info(f"帳號{account}回收站已清空")
+            return True
+        else:
+            if 'error_code' in result.text:
+                login(account)
+                login_headers = get_headers(account)
+                result = requests.post(url=empty_url, headers=login_headers, json={}, timeout=15)
+                if result.status_code == 200:
+                    logging.info(f"帳號{account}回收站已清空")
+                    return True
+            logging.error(f"帳號{account}清空回收站失敗: {result.text}")
+            return False
+    except Exception as e:
+        logging.error(f"帳號{account}清空回收站時發生錯誤: {e}")
+        return False
+
+
 # 重試離線下載任務 (使用 PikPak API 的 retry 功能)
 def retry_offline_task(task_id, account):
     """
@@ -755,7 +927,7 @@ def get_stuck_tasks(account, min_progress=90):
     tasks = get_offline_list(account)
     stuck = []
     
-    logging.info(f"[DEBUG] 帳號{account}共有 {len(tasks)} 個離線任務，篩選進度 >= {min_progress}%")
+    logging.debug(f"帳號{account}共有 {len(tasks)} 個離線任務，篩選進度 >= {min_progress}%")
     
     for task in tasks:
         phase = task.get('phase', '')
@@ -763,7 +935,7 @@ def get_stuck_tasks(account, min_progress=90):
         message = task.get('message', '')
         name = task.get('name') or task.get('file_name') or 'Unknown'
         
-        logging.info(f"[DEBUG]   任務: {name}, phase={phase}, progress={progress}%")
+        logging.debug(f"  任務: {name}, phase={phase}, progress={progress}%")
         
         # 忽略已完成的 (phase=COMPLETE 且 progress=100)
         if phase == 'PHASE_TYPE_COMPLETE' and progress == 100:
@@ -787,7 +959,7 @@ def get_stuck_tasks(account, min_progress=90):
                 'file_id': task.get('file_id'),
                 'phase': phase,  # 加入 phase 供 debug
             })
-            logging.info(f"[DEBUG]     ↳ 判定為卡住的任務")
+            logging.debug(f"    ↳ 判定為卡住的任務")
     
     return stuck
 
@@ -838,11 +1010,26 @@ def retry_stuck_tasks(account, min_progress=90, delete_cloud_files=True):
         if success:
             success_count += 1
             logging.info(f"  ↳ ✅ 已重新加入佇列")
+            
+            # Step 3: 啟動監控線程，等待 PikPak 完成後推送 Aria2
+            # 使用 main() 的 resume_task 模式
+            new_task_id = result.get('task', {}).get('id') if isinstance(result, dict) else None
+            task_info = {
+                'id': new_task_id or task_id,  # 優先使用新的 task_id
+                'name': task_name
+            }
+            thread_list.append(threading.Thread(
+                target=main,
+                args=[None, None, None, None, None, task_info, account]
+            ))
+            thread_list[-1].start()
+            logging.info(f"  ↳ 已啟動監控線程，等待完成後將推送 Aria2")
+            
             results.append({
                 'name': task_name,
                 'progress': progress,
                 'status': 'success',
-                'message': '已重新加入佇列'
+                'message': '已重新加入佇列並啟動監控'
             })
         else:
             fail_count += 1
@@ -854,7 +1041,7 @@ def retry_stuck_tasks(account, min_progress=90, delete_cloud_files=True):
                 'message': str(result)
             })
         
-        sleep(1)  # 避免請求過於頻繁
+        sleep(2)  # 避免請求過於頻繁，增加延遲
     
     logging.info(f"✅ 帳號{account}重試完成: 成功 {success_count}, 失敗 {fail_count}")
     return success_count, fail_count, results
@@ -1382,43 +1569,118 @@ def clean(update: Update, context: CallbackContext):
     if len(argv) == 0:  # 直接/clean则显示帮助
         context.bot.send_message(chat_id=update.effective_chat.id,
                                  text='【用法】\n' 
-                                      '`/clean all`\t清空所有帳號雲端硬碟\n' 
-                                      '/clean 帳號1 [帳號2] [...]\t清空指定帳號雲端硬碟',
+                                      '`/clean all`\t清空所有帳號雲端硬碟+離線任務記錄\n'
+                                      '`/clean deep`\t深度清理（檔案+回收站+所有離線任務記錄）\n'
+                                      '`/clean tasks`\t只清理離線任務記錄（不刪檔案）\n'
+                                      '`/clean tasks error`\t只清理失敗的離線任務記錄\n'
+                                      '/clean 帳號1 [帳號2] [...]\t清空指定帳號',
                                  parse_mode='Markdown')
 
     # 如果未完成
     elif check_download_thread_status():
         context.bot.send_message(chat_id=update.effective_chat.id, text='其他指令正在運行，為避免衝突，請稍後再試~')
 
-    elif argv[0] in ['a', 'all']:
+    # 深度清理：檔案 + 回收站 + 離線任務記錄
+    elif argv[0] in ['d', 'deep']:
+        context.bot.send_message(chat_id=update.effective_chat.id, text='🔄 開始深度清理...')
         for temp_account in USER:
             login(temp_account)
+            msg_parts = []
+            
+            # 1. 刪除所有檔案
             all_file_id = list(get_folder_all(temp_account))
-            # 如果没东西可删，那就下一个账号
-            if len(all_file_id) == 0:
-                context.bot.send_message(chat_id=update.effective_chat.id, text=f'帳號{temp_account}雲端硬碟無需清空')
-                logging.info(f'帳號{temp_account}雲端硬碟無需清空')
-                continue
-            delete_files(all_file_id, temp_account, mode='all')
-            delete_trash(all_file_id, temp_account, mode='all')
-            context.bot.send_message(chat_id=update.effective_chat.id, text=f'帳號{temp_account}雲端硬碟已清空')
-            logging.info(f'帳號{temp_account}雲端硬碟已清空')
+            if len(all_file_id) > 0:
+                delete_files(all_file_id, temp_account, mode='all')
+                msg_parts.append(f"已刪除 {len(all_file_id)} 個檔案")
+            
+            # 2. 清空回收站
+            if empty_trash(temp_account):
+                msg_parts.append("回收站已清空")
+            
+            # 3. 刪除所有離線任務記錄
+            success, fail = delete_offline_tasks(temp_account)
+            if success > 0:
+                msg_parts.append(f"已清理 {success} 個離線任務記錄")
+            
+            if msg_parts:
+                result_msg = f'帳號{temp_account}深度清理完成:\n' + '\n'.join(f'  ✅ {p}' for p in msg_parts)
+            else:
+                result_msg = f'帳號{temp_account}無需清理'
+            
+            context.bot.send_message(chat_id=update.effective_chat.id, text=result_msg)
+            logging.info(result_msg)
+
+    # 只清理離線任務記錄
+    elif argv[0] in ['t', 'tasks']:
+        phase_filter = None
+        if len(argv) >= 2 and argv[1] in ['e', 'error']:
+            phase_filter = 'PHASE_TYPE_ERROR'
+            context.bot.send_message(chat_id=update.effective_chat.id, text='🔄 正在清理失敗的離線任務記錄...')
+        else:
+            context.bot.send_message(chat_id=update.effective_chat.id, text='🔄 正在清理所有離線任務記錄...')
+        
+        for temp_account in USER:
+            login(temp_account)
+            success, fail = delete_offline_tasks(temp_account, phase_filter=phase_filter)
+            if success > 0 or fail > 0:
+                context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f'帳號{temp_account}離線任務記錄清理完成: ✅ {success} 個成功, ❌ {fail} 個失敗'
+                )
+            else:
+                context.bot.send_message(chat_id=update.effective_chat.id, text=f'帳號{temp_account}沒有需要清理的離線任務記錄')
+
+    elif argv[0] in ['a', 'all']:
+        context.bot.send_message(chat_id=update.effective_chat.id, text='🔄 開始清空所有帳號...')
+        for temp_account in USER:
+            login(temp_account)
+            msg_parts = []
+            
+            # 1. 刪除檔案
+            all_file_id = list(get_folder_all(temp_account))
+            if len(all_file_id) > 0:
+                delete_files(all_file_id, temp_account, mode='all')
+                delete_trash(all_file_id, temp_account, mode='all')
+                msg_parts.append(f"已刪除 {len(all_file_id)} 個檔案")
+            
+            # 2. 清理已完成和失敗的離線任務記錄
+            success, fail = delete_offline_tasks(temp_account, phase_filter='PHASE_TYPE_ERROR')
+            if success > 0:
+                msg_parts.append(f"已清理 {success} 個失敗的離線任務記錄")
+            
+            if msg_parts:
+                result_msg = f'帳號{temp_account}清空完成:\n' + '\n'.join(f'  ✅ {p}' for p in msg_parts)
+            else:
+                result_msg = f'帳號{temp_account}雲端硬碟無需清空'
+            
+            context.bot.send_message(chat_id=update.effective_chat.id, text=result_msg)
+            logging.info(result_msg)
 
     else:
         for each_account in argv:  # 输入参数是账户名称
             if each_account in USER:
                 login(each_account)
+                msg_parts = []
+                
+                # 1. 刪除檔案
                 all_file_id = list(get_folder_all(each_account))
-                # logging.info(all_file_id)
-                # 如果没东西可删，那就下一个账号
-                if len(all_file_id) == 0:
-                    context.bot.send_message(chat_id=update.effective_chat.id, text=f'帳號{each_account}雲端硬碟無需清空')
-                    logging.info(f'帳號{each_account}雲端硬碟無需清空')
-                    continue
-                delete_files(all_file_id, each_account, mode='all')
-                delete_trash(all_file_id, each_account, mode='all')
-                context.bot.send_message(chat_id=update.effective_chat.id, text=f'帳號{each_account}雲端硬碟已清空')
-                logging.info(f'帳號{each_account}雲端硬碟已清空')
+                if len(all_file_id) > 0:
+                    delete_files(all_file_id, each_account, mode='all')
+                    delete_trash(all_file_id, each_account, mode='all')
+                    msg_parts.append(f"已刪除 {len(all_file_id)} 個檔案")
+                
+                # 2. 清理失敗的離線任務記錄
+                success, fail = delete_offline_tasks(each_account, phase_filter='PHASE_TYPE_ERROR')
+                if success > 0:
+                    msg_parts.append(f"已清理 {success} 個失敗的離線任務記錄")
+                
+                if msg_parts:
+                    result_msg = f'帳號{each_account}清空完成:\n' + '\n'.join(f'  ✅ {p}' for p in msg_parts)
+                else:
+                    result_msg = f'帳號{each_account}雲端硬碟無需清空'
+                
+                context.bot.send_message(chat_id=update.effective_chat.id, text=result_msg)
+                logging.info(result_msg)
 
             else:
                 context.bot.send_message(chat_id=update.effective_chat.id, text=f'帳號{each_account}不存在！')
