@@ -750,30 +750,44 @@ def get_stuck_tasks(account, min_progress=90):
     """
     獲取卡住的離線任務
     min_progress: 最小進度閾值，預設 90%
-    返回: [(task_id, task_name, progress, file_id), ...]
+    返回: [{id, name, progress, file_id}, ...]
     """
     tasks = get_offline_list(account)
     stuck = []
+    
+    logging.info(f"[DEBUG] 帳號{account}共有 {len(tasks)} 個離線任務，篩選進度 >= {min_progress}%")
     
     for task in tasks:
         phase = task.get('phase', '')
         progress = int(task.get('progress', 0))
         message = task.get('message', '')
+        name = task.get('name') or task.get('file_name') or 'Unknown'
         
-        # 忽略已完成或已刪除的
+        logging.info(f"[DEBUG]   任務: {name}, phase={phase}, progress={progress}%")
+        
+        # 忽略已完成的 (phase=COMPLETE 且 progress=100)
         if phase == 'PHASE_TYPE_COMPLETE' and progress == 100:
             continue
+        
+        # 忽略已刪除的檔案
         if "file deleted" in message.lower() or "file_deleted" in message.lower():
             continue
         
-        # 篩選卡住的任務 (進度 >= min_progress 但未完成)
-        if progress >= min_progress and phase == 'PHASE_TYPE_RUNNING':
+        # 忽略錯誤狀態（非卡住，是真的失敗）
+        if phase == 'PHASE_TYPE_ERROR':
+            continue
+        
+        # 篩選卡住的任務: 進度 >= min_progress 但尚未完成
+        # 放寬條件：不限定 phase，只要進度夠高但沒完成就算卡住
+        if progress >= min_progress and progress < 100:
             stuck.append({
                 'id': task.get('id'),
-                'name': task.get('name') or task.get('file_name') or 'Unknown',
+                'name': name,
                 'progress': progress,
                 'file_id': task.get('file_id'),
+                'phase': phase,  # 加入 phase 供 debug
             })
+            logging.info(f"[DEBUG]     ↳ 判定為卡住的任務")
     
     return stuck
 
