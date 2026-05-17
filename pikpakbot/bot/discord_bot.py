@@ -42,6 +42,7 @@ from pikpakbot.pipeline import (
     batch_results,
     batch_lock,
     check_download_thread_status,
+    cleanup_failed_download_dir,
 )
 
 
@@ -149,6 +150,11 @@ async def _handle_retry_click(interaction: discord.Interaction, task_id: str):
             ephemeral=True,
         )
         return
+
+    # Clean up the failed attempt's local download dir before re-running so
+    # leftover .aria2 partials and the broken big file don't pile up.
+    cleaned, cleanup_msg = await _run_sync(cleanup_failed_download_dir, task.get('name'))
+    logging.info(f"retry cleanup for {task_id} ({task.get('name')}): {cleanup_msg}")
 
     notifier = DiscordNotifier(interaction.channel_id)
     t = threading.Thread(

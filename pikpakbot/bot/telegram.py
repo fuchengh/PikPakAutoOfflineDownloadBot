@@ -32,6 +32,7 @@ from pikpakbot.pipeline import (
     batch_results,
     batch_lock,
     check_download_thread_status,
+    cleanup_failed_download_dir,
 )
 
 
@@ -621,6 +622,15 @@ def handle_callback(update: Update, context: CallbackContext):
             context.bot.send_message(chat_id=query.message.chat_id,
                                      text=f'❌ 任務 {task_id} 沒有原始 magnet，無法重試（可能是 resume 任務）')
             return
+
+        # Clean up the failed attempt's local download dir before re-running so
+        # leftover .aria2 partials and the broken big file don't pile up.
+        cleaned, cleanup_msg = cleanup_failed_download_dir(task.get('name'))
+        logging.info(f"retry cleanup for {task_id} ({task.get('name')}): {cleanup_msg}")
+        if cleaned:
+            context.bot.send_message(chat_id=query.message.chat_id,
+                                     text=f'🧹 已清掉舊下載資料夾 `{task.get("name")}`',
+                                     parse_mode='Markdown')
 
         notifier = TelegramNotifier(context.bot, query.message.chat_id)
         thread_list.append(threading.Thread(

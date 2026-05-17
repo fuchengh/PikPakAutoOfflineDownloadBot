@@ -1,6 +1,9 @@
 import logging
+import os
 import re
+import shutil
 import threading
+from pathlib import Path
 from time import sleep, time
 
 import requests
@@ -14,6 +17,56 @@ from pikpakbot.notifier import ActionButton, Notifier, NullNotifier
 def _retry_buttons(task_id):
     """Standard [Retry] [Dismiss] button row for failure notifications."""
     return [ActionButton('🔄 重試', 'retry', task_id), ActionButton('✖️ 忽略', 'dismiss', task_id)]
+
+
+def cleanup_failed_download_dir(task_name):
+    """
+    Safely delete a failed task's aria2 download directory before retrying.
+
+    Returns (deleted: bool, message: str). All deletion paths are heavily guarded:
+    - empty / non-string name → skip
+    - name contains '/', '\\\\' or '..' → skip (path-traversal defense)
+    - resolved path must be strictly INSIDE ARIA2_DOWNLOAD_PATH
+    - resolved path must not equal ARIA2_DOWNLOAD_PATH itself
+    - must be a real directory (not a symlink, not a file)
+    - must not be in use by another in-flight task with the same `name`
+    """
+    if not task_name or not isinstance(task_name, str):
+        return False, "no task name"
+
+    if any(c in task_name for c in ('/', '\\')) or '..' in task_name:
+        return False, f"task name {task_name!r} contains path separator or '..'"
+
+    try:
+        root = Path(ARIA2_DOWNLOAD_PATH).resolve()
+        target = (Path(ARIA2_DOWNLOAD_PATH) / task_name).resolve()
+    except OSError as e:
+        return False, f"path resolve failed: {e}"
+
+    if target == root:
+        return False, "target resolved to download root itself"
+    try:
+        target.relative_to(root)
+    except ValueError:
+        return False, f"target {target} is outside {root}"
+
+    if target.is_symlink():
+        return False, "target is a symlink, refusing to delete"
+    if not target.exists():
+        return False, "directory does not exist (nothing to clean)"
+    if not target.is_dir():
+        return False, "target is not a directory"
+
+    # Don't pull the rug from under a concurrent task using the same name.
+    actives = state.list_active()
+    if any(a.get('name') == task_name for a in actives):
+        return False, f"another in-flight task still owns name {task_name!r}"
+
+    try:
+        shutil.rmtree(target)
+        return True, f"deleted {target}"
+    except Exception as e:
+        return False, f"rmtree failed: {e}"
 from pikpakbot.pikpak_client import (
     magnet_upload,
     get_offline_list,
