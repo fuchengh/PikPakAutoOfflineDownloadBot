@@ -279,11 +279,13 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
             total_files = max(1, len(gid))  # snapshot for progress %
             while not download_done:
                 temp_gid = gid.copy()
+                status_counts = {}  # for diagnostic log after this iteration
                 for each_gid in gid.keys():
                     try:
                         response = aria2_client.tell_status(each_gid, ["gid", "status", "errorMessage", "dir"])
                     except requests.exceptions.ReadTimeout:
                         logging.warning(f'查詢GID{each_gid}時網路請求超時，將跳過此次查詢！')
+                        status_counts['tell_status_timeout'] = status_counts.get('tell_status_timeout', 0) + 1
                         continue
                     except ValueError:
                         logging.warning(f'查詢GID{each_gid}時返回結果錯誤，可能是frp故障，將跳過此次查詢！')
@@ -292,9 +294,16 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
 
                     try:
                         status = response['result']['status']
+                        status_counts[status] = status_counts.get(status, 0) + 1
                         if status == 'complete':
                             temp_gid.pop(each_gid)
                             complete_file_id.append(gid[each_gid][1])
+                        elif status == 'removed':
+                            # aria2 marked this download as removed (manual or auto).
+                            # Bot would otherwise poll forever; treat as failed.
+                            notifier.send(f'aria2 任務 {gid[each_gid][0]} 被標記為 removed（已被刪除），視為失敗')
+                            logging.warning(f'aria2 GID {each_gid} ({gid[each_gid][0]}) status=removed，標記失敗')
+                            failed_gid[each_gid] = temp_gid.pop(each_gid)
                         elif status == 'error':
                             error_message = response["result"]["errorMessage"]
                             if error_message in ['No URI available.', 'SSL/TLS handshake failure: SSL I/O error']:
@@ -419,8 +428,10 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
                     done_count = len(complete_file_id) + len(failed_gid)
                     aria_progress = int(done_count / total_files * 100)
                     state.update_task(task_id, progress=aria_progress)
+                    status_summary = ', '.join(f'{k}={v}' for k, v in sorted(status_counts.items())) or '(no responses)'
                     logging.info(
-                        f'aria2下載{down_name}還未完成 ({done_count}/{total_files} = {aria_progress}%)，睡眠20s後再查...'
+                        f'aria2下載{down_name}還未完成 ({done_count}/{total_files} = {aria_progress}%) — '
+                        f'status: {status_summary}，睡眠20s後再查...'
                     )
                     sleep(20)
 
