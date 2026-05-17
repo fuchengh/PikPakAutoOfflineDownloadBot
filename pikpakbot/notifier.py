@@ -75,12 +75,37 @@ class NullNotifier:
         pass
 
 
+_EMBED_COLOR_BY_PREFIX = {
+    '✅': 0x2ecc71,  # green — success
+    '❌': 0xe74c3c,  # red — failure
+    '⚠️': 0xf1c40f,  # yellow — warning
+    '🔄': 0xf1c40f,  # yellow — retrying
+    '📥': 0x3498db,  # blue — submitting
+    '📋': 0x3498db,  # blue — info / list
+    '📜': 0x3498db,  # blue — history
+    '🧹': 0x3498db,  # blue — cleanup
+    '☁️': 0x3498db,  # blue — offline progress
+    '⬇️': 0x3498db,  # blue — download progress
+}
+
+
+def _color_for_text(text: str) -> int:
+    """Heuristic embed color based on the leading emoji."""
+    for prefix, color in _EMBED_COLOR_BY_PREFIX.items():
+        if text.startswith(prefix):
+            return color
+    return 0x95a5a6  # neutral grey
+
+
 class DiscordNotifier:
     """Schedules sends onto the Discord client's asyncio loop from sync code.
 
     The bridge is fire-and-forget — sync callers don't block waiting for the
     Discord API. If the client isn't ready yet (e.g. during bot boot), the
     message is dropped with a warning.
+
+    channel_id can be either a text channel id or a thread id; the Discord
+    API treats both the same for `get_channel` / `send`.
     """
     def __init__(self, channel_id):
         self.channel_id = int(channel_id) if channel_id else 0
@@ -115,15 +140,17 @@ class DiscordNotifier:
             logging.error(f"DiscordNotifier: channel {self.channel_id} not found: {e}")
             return
 
+        import discord
         view = None
         if buttons:
-            import discord
             view = discord.ui.View(timeout=None)
             for b in buttons:
                 view.add_item(discord.ui.Button(label=b.label, custom_id=b.callback_data))
 
-        # Discord caps a single message at 2000 chars.
+        # Embed description caps at 4096 chars; plain content caps at 2000.
+        # Using embed lets us show longer status without truncation, plus colored sidebar.
+        embed = discord.Embed(description=text[:4000], color=_color_for_text(text))
         try:
-            await channel.send(text[:2000], view=view)
+            await channel.send(embed=embed, view=view)
         except Exception as e:
             logging.error(f"DiscordNotifier send failed: {e}")

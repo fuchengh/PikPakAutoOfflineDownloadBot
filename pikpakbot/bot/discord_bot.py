@@ -90,6 +90,53 @@ async def _run_sync(func, *args, **kwargs):
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
 
+def _magnet_summary(magnet: str) -> str:
+    """Short human-readable summary of a magnet for thread/log names."""
+    import re
+    m = re.search(r'xt=urn:btih:([0-9a-fA-F]+)', magnet)
+    if m:
+        return m.group(1)[:12]
+    return magnet[:40]
+
+
+# ---- Autocomplete callbacks for slash command params ----
+
+def _filter_choices(values, current: str, limit: int = 25):
+    """Filter and cap value list for Discord's 25-choice limit."""
+    needle = (current or '').lower()
+    result = [v for v in values if needle in v.lower()]
+    return result[:limit]
+
+
+async def _clean_mode_autocomplete(interaction, current: str):
+    base = ['all', 'deep', 'tasks', 'tasks_error']
+    return [
+        app_commands.Choice(name=v, value=v)
+        for v in _filter_choices(base + list(USER), current)
+    ]
+
+
+async def _account_autocomplete(interaction, current: str):
+    return [
+        app_commands.Choice(name=u, value=u)
+        for u in _filter_choices(list(USER), current)
+    ]
+
+
+async def _toggle_mode_autocomplete(interaction, current: str):
+    return [
+        app_commands.Choice(name=v, value=v)
+        for v in _filter_choices(['on', 'off'], current)
+    ]
+
+
+async def _path_action_autocomplete(interaction, current: str):
+    return [
+        app_commands.Choice(name=v, value=v)
+        for v in _filter_choices(['info', 'default', 'set'], current)
+    ]
+
+
 async def _handle_retry_click(interaction: discord.Interaction, task_id: str):
     task = state.get_task(task_id)
     if not task:
@@ -186,8 +233,23 @@ def _register_commands(bot: commands.Bot):
         with batch_lock:
             batch_results[batch_id] = {'total': len(argv), 'processed': 0, 'results': []}
 
-        notifier = DiscordNotifier(interaction.channel_id)
+        # Create one thread per magnet so status spam doesn't crowd the main channel.
+        # If thread creation fails (perms, DM, etc.), fall back to posting in the channel.
+        parent = interaction.channel
         for each_magnet in argv:
+            target_id = interaction.channel_id
+            if parent and hasattr(parent, 'create_thread'):
+                try:
+                    th = await parent.create_thread(
+                        name=f"📥 {_magnet_summary(each_magnet)}"[:100],
+                        type=discord.ChannelType.public_thread,
+                        auto_archive_duration=1440,
+                    )
+                    target_id = th.id
+                except Exception as e:
+                    logging.warning(f'Discord thread 建立失敗，落回 channel: {e}')
+
+            notifier = DiscordNotifier(target_id)
             t = threading.Thread(
                 target=process_magnet,
                 args=[notifier, each_magnet, resolved_offline, batch_id, None, None],
@@ -246,6 +308,7 @@ def _register_commands(bot: commands.Bot):
     # ---- /clean ----
     @bot.tree.command(name='clean', description='Clear cloud files / offline records')
     @app_commands.describe(mode='all / deep / tasks / tasks_error / <account-name>')
+    @app_commands.autocomplete(mode=_clean_mode_autocomplete)
     async def clean_cmd(interaction: discord.Interaction, mode: str):
         if check_download_thread_status():
             await interaction.response.send_message('其他指令正在運行，為避免衝突，請稍後再試~', ephemeral=True)
@@ -326,6 +389,7 @@ def _register_commands(bot: commands.Bot):
     # ---- /path ----
     @bot.tree.command(name='path', description='Manage PikPak offline download path')
     @app_commands.describe(action='info / default / set', value='Absolute path when action=set')
+    @app_commands.autocomplete(action=_path_action_autocomplete)
     async def path_cmd(interaction: discord.Interaction, action: Optional[str] = 'info',
                        value: Optional[str] = None):
         if action == 'info':
@@ -375,6 +439,7 @@ def _register_commands(bot: commands.Bot):
     # ---- /account-delete ----
     @bot.tree.command(name='account-delete', description='Remove a PikPak account')
     @app_commands.describe(account='Account to remove')
+    @app_commands.autocomplete(account=_account_autocomplete)
     async def account_delete_cmd(interaction: discord.Interaction, account: str):
         try:
             idx = USER.index(account)
@@ -391,6 +456,7 @@ def _register_commands(bot: commands.Bot):
     # ---- /account-toggle ----
     @bot.tree.command(name='account-toggle', description='Toggle auto-delete for an account')
     @app_commands.describe(account='Account name', mode='on or off')
+    @app_commands.autocomplete(account=_account_autocomplete, mode=_toggle_mode_autocomplete)
     async def account_toggle_cmd(interaction: discord.Interaction, account: str, mode: str):
         if account not in USER:
             await interaction.response.send_message(f'帳號 {account} 不存在', ephemeral=True)
