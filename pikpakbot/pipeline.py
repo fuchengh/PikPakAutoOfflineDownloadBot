@@ -82,6 +82,15 @@ batch_results = {}
 
 
 def record_batch_result(batch_id, status, name, message, notifier: Notifier):
+    """Record one task's result in the batch + update the batch-level message.
+
+    The batch summary goes to the batch_notifier (set by the /p handler to the
+    channel where /p was invoked — main channel, not a per-task thread). Falls
+    back to the per-task notifier if /p didn't register one (legacy callers).
+
+    Uses progress() so the batch summary lives in ONE message that edits in
+    place as tasks finish — no scrolling wall of partial summaries.
+    """
     global batch_results
     if not batch_id:
         return
@@ -97,25 +106,31 @@ def record_batch_result(batch_id, status, name, message, notifier: Notifier):
             'message': message
         })
 
-        if batch_results[batch_id]['processed'] == batch_results[batch_id]['total']:
-            results = batch_results[batch_id]['results']
-            success_count = sum(1 for r in results if r['status'] == 'success')
-            fail_count = sum(1 for r in results if r['status'] == 'fail')
+        batch_notifier = batch_results[batch_id].get('notifier') or notifier
+        results = batch_results[batch_id]['results']
+        processed = batch_results[batch_id]['processed']
+        total = batch_results[batch_id]['total']
+        success_count = sum(1 for r in results if r['status'] == 'success')
+        fail_count = sum(1 for r in results if r['status'] == 'fail')
+        all_done = processed == total
 
-            summary = f"📋 <b>下載任務匯總 (Batch Summary)</b>\n"
-            summary += f"-------------------------\n"
-            summary += f"✅ 成功: {success_count}\n"
-            summary += f"❌ 失敗: {fail_count}\n"
-            summary += f"-------------------------\n"
-
+        header = '📋 批次下載完成' if all_done else '📋 批次下載進行中'
+        lines = [
+            header,
+            f'進度: {processed}/{total}',
+            f'✅ 成功: {success_count}   ❌ 失敗: {fail_count}',
+        ]
+        if all_done:
+            lines.append('───────────────')
             for i, res in enumerate(results, 1):
-                icon = "✅" if res['status'] == 'success' else "❌"
-                summary += f"{i}. {icon} {res['name']}\n"
+                icon = '✅' if res['status'] == 'success' else '❌'
+                lines.append(f'{i}. {icon} {res["name"]}')
                 if res['message']:
-                    summary += f"   └ {res['message']}\n"
+                    lines.append(f'   └ {res["message"]}')
 
-            notifier.send(summary, parse_mode='HTML')
+        batch_notifier.progress(f'batch:{batch_id}', '\n'.join(lines))
 
+        if all_done:
             del batch_results[batch_id]
 
 
@@ -176,7 +191,10 @@ def _run_aria2_phase(notifier: Notifier, file_id, account, task_id, batch_id, so
             gid[response['result']] = [f'{name}', down_file_id, url]
             logging.info(f'{path}{name}推送aria2下載')
 
-        notifier.send(f'資料夾已推送aria2下載：\n{down_name}\n請耐心等待...')
+        notifier.progress(
+            task_id,
+            f'⬇️ aria2 下載中\n資料夾: {down_name}\n檔案數: {len(gid)}\n進度: 0% (剛推送)'
+        )
         logging.info(f'{down_name}資料夾下所有檔案已推送aria2下載，請耐心等待...')
 
     else:
@@ -201,15 +219,18 @@ def _run_aria2_phase(notifier: Notifier, file_id, account, task_id, batch_id, so
                 continue
 
         if not push_flag:
-            print_info = f'{down_name}推送aria2下載失敗（多次重試無效）！該檔案直連如下，請手動下載：\n{down_url}'
-            notifier.send(print_info, buttons=_retry_buttons(task_id))
-            logging.error(print_info)
+            notifier.progress(task_id, f'❌ aria2 推送失敗 (多次重試無效)\n檔案: {down_name}')
+            notifier.send(f'直連: {down_url}', buttons=_retry_buttons(task_id))
+            logging.error(f'{down_name}推送aria2下載失敗（多次重試無效）！直連: {down_url}')
             record_batch_result(batch_id, 'fail', down_name, "推送Aria2失敗", notifier)
             state.update_task(task_id, name=down_name, stage=state.STAGE_FAILED, error="推送Aria2失敗")
             return
 
         gid[response['result']] = [down_name, file_id, down_url]
-        notifier.send(f'檔案已推送aria2下載：\n{down_name}\n請耐心等待...')
+        notifier.progress(
+            task_id,
+            f'⬇️ aria2 下載中\n檔案: {down_name}\n進度: 0% (剛推送)'
+        )
         logging.info(f'{down_name}已推送aria2下載，請耐心等待...')
 
     state.update_task(task_id, name=down_name, stage=state.STAGE_DOWNLOAD, progress=0)
@@ -361,12 +382,16 @@ def _run_aria2_phase(notifier: Notifier, file_id, account, task_id, batch_id, so
                 else:
                     print_info += f'帳號{account}中下載成功的雲端硬碟檔案刪除失敗，請手動刪除\n'
 
-                notifier.send(print_info, buttons=_retry_buttons(task_id))
+                notifier.progress(task_id, '❌ ' + print_info)
                 logging.info(print_info)
 
-                print_info = f'對於下載失敗的檔案可使用指令：\n`/clean {account}`清空此帳號下所有檔案'
-                notifier.send(print_info, parse_mode='Markdown')
-                logging.info(print_info)
+                # Buttons live on their own message so progress() can keep editing
+                # the status line.
+                notifier.send(
+                    f'部分檔案失敗。`/clean {account}` 可清空此帳號所有檔案',
+                    parse_mode='Markdown',
+                    buttons=_retry_buttons(task_id),
+                )
                 record_batch_result(batch_id, 'fail', down_name,
                                     f"部分檔案下載失敗: {len(failed_gid)}個", notifier)
                 state.update_task(task_id, stage=state.STAGE_FAILED,
@@ -395,7 +420,7 @@ def _run_aria2_phase(notifier: Notifier, file_id, account, task_id, batch_id, so
                     print_info += f'\n帳號{account}未開啟自動刪除'
                 else:
                     print_info += f'\n帳號{account}中該檔案的雲端硬碟空間釋放失敗，請手動刪除'
-                notifier.send(print_info)
+                notifier.progress(task_id, '✅ ' + print_info)
                 logging.info(print_info)
 
                 record_batch_result(batch_id, 'success', down_name, "", notifier)
@@ -406,14 +431,21 @@ def _run_aria2_phase(notifier: Notifier, file_id, account, task_id, batch_id, so
             if total_bytes > 0:
                 done_bytes = sum(b['completed'] for b in gid_bytes.values())
                 aria_progress = int(done_bytes / total_bytes * 100)
-                byte_summary = f', {done_bytes / 1e9:.2f}GB/{total_bytes / 1e9:.2f}GB'
+                byte_summary = f'{done_bytes / 1e9:.2f}/{total_bytes / 1e9:.2f} GB'
             else:
                 aria_progress = int(done_count / total_files * 100)
                 byte_summary = ''
             state.update_task(task_id, progress=aria_progress)
             status_summary = ', '.join(f'{k}={v}' for k, v in sorted(status_counts.items())) or '(no responses)'
+            progress_lines = [f'⬇️ aria2 下載中', f'檔案: {down_name}']
+            if total_files > 1:
+                progress_lines.append(f'檔案: {done_count}/{total_files} 完成')
+            if byte_summary:
+                progress_lines.append(f'位元組: {byte_summary}')
+            progress_lines.append(f'進度: {aria_progress}%')
+            notifier.progress(task_id, '\n'.join(progress_lines))
             logging.info(
-                f'aria2下載{down_name}還未完成 ({done_count}/{total_files} files{byte_summary} = {aria_progress}%) — '
+                f'aria2下載{down_name}還未完成 ({done_count}/{total_files} files, {byte_summary} = {aria_progress}%) — '
                 f'status: {status_summary}，睡眠20s後再查...'
             )
             sleep(20)
@@ -443,6 +475,10 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
         task_id = state.create_task(magnet=magnet, stage=state.STAGE_QUEUED)
 
     try:
+        # First heartbeat — shows up in the thread immediately so the user knows
+        # the task is alive even before PikPak has accepted the magnet.
+        notifier.progress(task_id, f'📥 接受任務，提交至 PikPak 中...\n{mag_url_simple}')
+
         for each_account in USER:
             if resume_task and each_account != target_account:
                 continue
@@ -468,15 +504,22 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
 
             if not mag_id:
                 if each_account == USER[-1]:
-                    print_info = f'{mag_url_simple}所有帳號均離線下載失敗！可能是所有帳號免費離線次數用盡，或者檔案大小超過雲端硬碟剩餘容量！'
-                    notifier.send(print_info, buttons=_retry_buttons(task_id))
-                    logging.warning(print_info)
+                    notifier.progress(
+                        task_id,
+                        f'❌ 所有帳號均離線下載失敗\n{mag_url_simple}\n可能原因: 免費離線次數用盡 / 雲端容量不足'
+                    )
+                    notifier.send('要重試嗎？', buttons=_retry_buttons(task_id))
+                    logging.warning(f'{mag_url_simple}所有帳號均離線下載失敗！')
                     record_batch_result(batch_id, 'fail', mag_url_simple, "所有帳號離線失敗", notifier)
                     state.update_task(task_id, stage=state.STAGE_FAILED, error="所有帳號離線失敗")
                     return
                 continue
 
             state.update_task(task_id, name=mag_name, account=each_account, stage=state.STAGE_OFFLINE)
+            notifier.progress(
+                task_id,
+                f'☁️ 已提交 PikPak 離線下載\n檔案: {mag_name or mag_url_simple}\n帳號: {each_account}\n進度: 0% (剛開始)'
+            )
             done = False
             logging.info('5s後將檢查離線下載進度...')
             sleep(5)
@@ -500,30 +543,44 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
                             if each_down['progress'] == 100 and msg == 'Saved':
                                 done = True
                                 file_id = each_down['file_id']
-                                print_info = f'帳號{each_account}離線下載磁力已完成：\n{mag_url_simple}\n檔案名稱：{mag_name}'
-                                notifier.send(print_info)
-                                logging.info(print_info)
+                                notifier.progress(
+                                    task_id,
+                                    f'✅ 離線下載完成\n檔案: {mag_name}\n帳號: {each_account}\n準備推送 aria2...'
+                                )
+                                logging.info(f'帳號{each_account}離線下載磁力已完成：{mag_url_simple} 檔案名稱：{mag_name}')
                             elif each_down['progress'] == 100:
                                 done = True
                                 file_id = each_down['file_id']
-                                print_info = f'帳號{each_account}離線下載磁力已完成:\n{mag_url_simple}\n但含有訊息：' \
-                                             f'{msg.strip()}！\n檔案名稱：{mag_name}'
-                                notifier.send(print_info)
-                                logging.warning(print_info)
+                                notifier.progress(
+                                    task_id,
+                                    f'⚠️ 離線下載完成（含警告）\n檔案: {mag_name}\n帳號: {each_account}\n訊息: {msg.strip()}\n準備推送 aria2...'
+                                )
+                                logging.warning(
+                                    f'帳號{each_account}離線下載磁力已完成: {mag_url_simple} 但含有訊息：{msg.strip()}！檔案名稱：{mag_name}'
+                                )
                             else:
                                 current_file_name = each_down.get('file_name') or each_down.get('name') or mag_name or mag_url_simple
-                                logging.info(
-                                    f'帳號{each_account}離線下載 "{current_file_name}" 還未完成，進度{each_down["progress"]}%...'
+                                pct = int(each_down["progress"])
+                                elapsed = int(time() - offline_start)
+                                notifier.progress(
+                                    task_id,
+                                    f'☁️ PikPak 離線下載中\n檔案: {current_file_name}\n帳號: {each_account}\n進度: {pct}%\n已等待: {elapsed // 60}分{elapsed % 60}秒'
                                 )
-                                state.update_task(task_id, progress=int(each_down["progress"]))
+                                logging.info(
+                                    f'帳號{each_account}離線下載 "{current_file_name}" 還未完成，進度{pct}%...'
+                                )
+                                state.update_task(task_id, progress=pct)
                                 sleep(10)
                             break
                     if not find:
                         not_found_count += 1
                         if not_found_count >= 5:
-                            print_info = f'帳號{each_account}離線下載{mag_url_simple}的任務被取消（或多次查詢未找到）！'
-                            notifier.send(print_info, buttons=_retry_buttons(task_id))
-                            logging.warning(print_info)
+                            notifier.progress(
+                                task_id,
+                                f'❌ 離線任務被取消或多次查詢未找到\n{mag_url_simple}\n帳號: {each_account}'
+                            )
+                            notifier.send('要重試嗎？', buttons=_retry_buttons(task_id))
+                            logging.warning(f'帳號{each_account}離線下載{mag_url_simple}的任務被取消（或多次查詢未找到）！')
                             state.update_task(task_id, stage=state.STAGE_FAILED, error="離線任務被取消或多次查詢未找到")
                             break
                         else:
@@ -543,9 +600,12 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
                     return
                 break
             elif find and not done:
-                print_info = f'帳號{each_account}離線下載{mag_url_simple}的任務超時（1小時）！已取消該任務！'
-                notifier.send(print_info, buttons=_retry_buttons(task_id))
-                logging.warning(print_info)
+                notifier.progress(
+                    task_id,
+                    f'❌ 離線下載超時 (1 小時)\n檔案: {mag_name or mag_url_simple}\n帳號: {each_account}'
+                )
+                notifier.send('要重試嗎？', buttons=_retry_buttons(task_id))
+                logging.warning(f'帳號{each_account}離線下載{mag_url_simple}的任務超時（1小時）！已取消該任務！')
                 record_batch_result(batch_id, 'fail', mag_name if mag_name else mag_url_simple,
                                     "離線下載超時", notifier)
                 state.update_task(task_id, stage=state.STAGE_FAILED, error="離線下載超時（1小時）")
@@ -645,9 +705,12 @@ def startup_recovery(admin_notifier: Notifier):
                         'id': task.get('id'),
                         'name': task.get('name') or task.get('file_name')
                     }
+                    # Per-task sub-channel (Discord thread) so recovery noise
+                    # stays out of the main channel. TG returns self.
+                    task_notifier = admin_notifier.create_task_channel(task_info['name'] or '恢復任務')
                     thread_list.append(threading.Thread(
                         target=process_magnet,
-                        args=[admin_notifier, None, None, None, task_info, account]
+                        args=[task_notifier, None, None, None, task_info, account]
                     ))
                     thread_list[-1].start()
                     resumed_count += 1

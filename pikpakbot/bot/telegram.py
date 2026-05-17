@@ -24,6 +24,7 @@ from pikpakbot.pikpak_client import (
     delete_files,
     delete_trash,
     delete_offline_tasks,
+    cancel_offline_tasks_by_name,
     empty_trash,
     get_my_vip,
 )
@@ -137,14 +138,16 @@ def pikpak(update: Update, context: CallbackContext):
             logging.info(f'檢測到自定義下載路徑 {offline_path}，將離線到此路徑')
 
         batch_id = str(uuid.uuid4())[:8]
+        notifier = TelegramNotifier(context.bot, update.effective_chat.id)
         with batch_lock:
             batch_results[batch_id] = {
                 'total': len(argv),
                 'processed': 0,
-                'results': []
+                'results': [],
+                # TG has no thread concept so this is just the same chat, but
+                # keeping the key consistent with the Discord path.
+                'notifier': notifier,
             }
-
-        notifier = TelegramNotifier(context.bot, update.effective_chat.id)
         for each_magnet in argv:
             thread_list.append(threading.Thread(
                 target=process_magnet,
@@ -727,6 +730,24 @@ def handle_callback(update: Update, context: CallbackContext):
             context.bot.send_message(chat_id=query.message.chat_id,
                                      text=f'🧹 已清掉舊下載資料夾 `{task.get("name")}`',
                                      parse_mode='Markdown')
+
+        # Also cancel any old PikPak offline tasks with the same name (could be
+        # still 'downloading' or a completed one whose cloud folder is now an
+        # orphan). delete_files=True nukes the cloud folder too so the user
+        # doesn't end up with duplicate PikPak downloads/folders after retry.
+        task_name = task.get('name')
+        task_account = task.get('account')
+        if task_name and task_account:
+            try:
+                matched, ok, bad = cancel_offline_tasks_by_name(
+                    task_account, task_name, delete_cloud_files=True
+                )
+                if matched:
+                    logging.info(
+                        f"retry cloud cleanup for {task_id}: matched={matched} deleted={ok} failed={bad}"
+                    )
+            except Exception as e:
+                logging.warning(f"retry cloud cleanup for {task_id} failed (continuing): {e}")
 
         notifier = TelegramNotifier(context.bot, query.message.chat_id)
         thread_list.append(threading.Thread(

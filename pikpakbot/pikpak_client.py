@@ -401,6 +401,30 @@ def delete_offline_tasks(account, task_ids=None, delete_files_too=False, phase_f
     return success_count, fail_count
 
 
+def cancel_offline_tasks_by_name(account, name, delete_cloud_files=True):
+    """Cancel/delete all offline tasks on PikPak whose name matches `name`.
+
+    Used by the retry button: before re-submitting a failed magnet, kill any
+    leftover offline tasks (still downloading, errored, or completed-with-orphan-
+    cloud-folder) so PikPak doesn't end up showing two duplicates and the cloud
+    doesn't accumulate orphan folders.
+
+    Returns (matched_count, success_count, fail_count). matched_count==0 means
+    nothing to clean — not an error.
+    """
+    if not name or not account:
+        return 0, 0, 0
+    tasks = get_offline_list(account)
+    matches = [t['id'] for t in tasks if t.get('name') == name and t.get('id')]
+    if not matches:
+        return 0, 0, 0
+    logging.info(f"帳號{account} retry 前清理：找到 {len(matches)} 個同名舊離線任務 ({name!r})")
+    success, fail = delete_offline_tasks(
+        account, task_ids=matches, delete_files_too=delete_cloud_files
+    )
+    return len(matches), success, fail
+
+
 def empty_trash(account):
     """清空回收站中的所有檔案"""
     empty_url = f"{PIKPAK_API_URL}/drive/v1/files/trash:empty"
@@ -574,9 +598,12 @@ def retry_stuck_tasks(account, min_progress=90, delete_cloud_files=True, notifie
                 'id': new_task_id or task_id,
                 'name': task_name
             }
+            # Per-task sub-channel so the watchdog's auto-retries don't all
+            # dump their progress + failure into the main channel. TG no-op.
+            task_notifier = notifier.create_task_channel(task_name or '卡住任務重試')
             thread_list.append(threading.Thread(
                 target=process_magnet,
-                args=[notifier, None, None, None, task_info, account]
+                args=[task_notifier, None, None, None, task_info, account]
             ))
             thread_list[-1].start()
             logging.info(f"  ↳ 已啟動監控線程，等待完成後將推送 Aria2")

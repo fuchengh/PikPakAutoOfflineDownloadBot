@@ -36,6 +36,7 @@ from pikpakbot.pikpak_client import (
     delete_files,
     delete_trash,
     delete_offline_tasks,
+    cancel_offline_tasks_by_name,
     empty_trash,
 )
 from pikpakbot.pipeline import (
@@ -196,6 +197,37 @@ async def _handle_retry_click(interaction: discord.Interaction, task_id: str):
     cleaned, cleanup_msg = await _run_sync(cleanup_failed_download_dir, task.get('name'))
     logging.info(f"retry cleanup for {task_id} ({task.get('name')}): {cleanup_msg}")
 
+    # Also cancel any old PikPak offline tasks with the same name (the previous
+    # attempt may have left one in 'downloading' state or completed with an
+    # orphan cloud folder). delete_files=True nukes the cloud folder too so we
+    # don't end up with duplicate downloads on the PikPak side.
+    task_name = task.get('name')
+    task_account = task.get('account')
+    if task_name and task_account:
+        try:
+            matched, ok, bad = await _run_sync(
+                cancel_offline_tasks_by_name, task_account, task_name, True
+            )
+            if matched:
+                logging.info(
+                    f"retry cloud cleanup for {task_id}: matched={matched} deleted={ok} failed={bad}"
+                )
+        except Exception as e:
+            logging.warning(f"retry cloud cleanup for {task_id} failed (continuing): {e}")
+
+    # Reset the thread icon from ❌ back to 🔄 (retrying). finalize() will flip
+    # it to ✅/❌ again when the new task ends.
+    if isinstance(interaction.channel, discord.Thread):
+        try:
+            cur = interaction.channel.name
+            for prefix in ('❌ ', '✅ ', '📥 ', '🔄 '):
+                if cur.startswith(prefix):
+                    cur = cur[len(prefix):]
+                    break
+            await interaction.channel.edit(name=f'🔄 {cur}'[:100])
+        except Exception as e:
+            logging.warning(f'retry: rename thread to 🔄 failed: {e}')
+
     notifier = DiscordNotifier(interaction.channel_id)
     t = threading.Thread(
         target=process_magnet,
@@ -284,8 +316,17 @@ def _register_commands(bot: commands.Bot):
 
         import uuid
         batch_id = str(uuid.uuid4())[:8]
+        # batch summary goes to the channel where /p was invoked, NOT to one of
+        # the per-magnet threads (which would dump the whole summary into
+        # whichever task happened to finish last).
+        batch_notifier = DiscordNotifier(interaction.channel_id)
         with batch_lock:
-            batch_results[batch_id] = {'total': len(argv), 'processed': 0, 'results': []}
+            batch_results[batch_id] = {
+                'total': len(argv),
+                'processed': 0,
+                'results': [],
+                'notifier': batch_notifier,
+            }
 
         # Create one thread per magnet so status spam doesn't crowd the main channel.
         # If thread creation fails (perms, DM, etc.), fall back to posting in the channel.
