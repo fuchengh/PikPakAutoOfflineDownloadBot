@@ -284,6 +284,13 @@ def _register_commands(bot: commands.Bot):
                         auto_archive_duration=1440,
                     )
                     target_id = th.id
+                    # Add the submitter to the thread so it appears under the channel
+                    # in their server sidebar (otherwise Discord doesn't surface
+                    # bot-created threads automatically).
+                    try:
+                        await th.add_user(interaction.user)
+                    except Exception as e:
+                        logging.warning(f'Discord thread add_user 失敗: {e}')
                 except Exception as e:
                     logging.warning(f'Discord thread 建立失敗，落回 channel: {e}')
 
