@@ -695,9 +695,10 @@ def start_discord(token: str):
         logging.info(f'Discord 已連接: {bot.user} (id={bot.user.id})')
         try:
             synced = await bot.tree.sync()
-            logging.info(f'Discord: 同步了 {len(synced)} 個 slash command')
+            names = sorted(c.name for c in synced)
+            logging.info(f'Discord: 同步了 {len(synced)} 個 slash command: {names}')
         except Exception as e:
-            logging.error(f'Discord slash command 同步失敗: {e}')
+            logging.exception(f'Discord slash command 同步失敗: {e}')
         # Push presence immediately so users see something right away, then
         # let the loop take over.
         try:
