@@ -630,16 +630,25 @@ def ls_cmd(update: Update, context: CallbackContext):
         context.bot.send_message(chat_id=update.effective_chat.id, text='沒有設定帳號')
         return
 
-    files = get_list(folder_id, account)
-    if not files:
+    location = 'root (/)' if not folder_id else f'folder `{folder_id}`'
+    header = f'📂 PikPak: *{location}* — 帳號 `{account}`'
+
+    try:
+        files = get_list(folder_id, account)
+    except Exception as e:
+        logging.exception(f'/ls failed: folder={folder_id!r}, account={account}')
         context.bot.send_message(chat_id=update.effective_chat.id,
-                                 text=f'📁 (空) — folder_id=`{folder_id or "root"}`, account=`{account}`',
+                                 text=f'{header}\n\n❌ 抓取失敗: `{e}`',
                                  parse_mode='Markdown')
         return
 
-    lines = [f'📁 *PikPak 雲端內容* (帳號: `{account}`)']
-    if folder_id:
-        lines[0] += f' folder=`{folder_id}`'
+    if not files:
+        context.bot.send_message(chat_id=update.effective_chat.id,
+                                 text=f'{header}\n\n📭 (這個資料夾是空的)',
+                                 parse_mode='Markdown')
+        return
+
+    lines = [header, '']
     for f in files:
         is_folder = f.get('kind') == 'drive#folder'
         icon = '📁' if is_folder else '📄'

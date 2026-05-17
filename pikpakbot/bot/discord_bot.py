@@ -380,16 +380,21 @@ def _register_commands(bot: commands.Bot):
             return
         await interaction.response.defer()
         folder = '' if (not folder_id or folder_id == 'root') else folder_id
-        files = await _run_sync(get_list, folder, target_account)
-        if not files:
-            await interaction.followup.send(
-                f'📁 (空) — folder=`{folder or "root"}`, account=`{target_account}`'
-            )
+        location = f'root (/)' if not folder else f'folder `{folder}`'
+        header = f'📂 PikPak: **{location}** — 帳號 `{target_account}`'
+
+        try:
+            files = await _run_sync(get_list, folder, target_account)
+        except Exception as e:
+            logging.exception(f'/ls 失敗: folder={folder!r}, account={target_account}')
+            await interaction.followup.send(f'{header}\n\n❌ 抓取失敗: `{e}`')
             return
 
-        lines = [f'**📁 PikPak 雲端內容** (帳號: `{target_account}`)']
-        if folder:
-            lines[0] += f' folder=`{folder}`'
+        if not files:
+            await interaction.followup.send(f'{header}\n\n📭 (這個資料夾是空的)')
+            return
+
+        lines = [header, '']
         for f in files:
             is_folder = f.get('kind') == 'drive#folder'
             icon = '📁' if is_folder else '📄'
