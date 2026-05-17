@@ -90,8 +90,64 @@ async def _run_sync(func, *args, **kwargs):
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
 
+async def _handle_retry_click(interaction: discord.Interaction, task_id: str):
+    task = state.get_task(task_id)
+    if not task:
+        await interaction.response.send_message(f'❌ 找不到任務 `{task_id}`', ephemeral=True)
+        return
+    magnet = task.get('magnet')
+    if not magnet:
+        await interaction.response.send_message(
+            f'❌ 任務 `{task_id}` 沒有原始 magnet，無法重試（可能是 resume 任務）',
+            ephemeral=True,
+        )
+        return
+
+    notifier = DiscordNotifier(interaction.channel_id)
+    t = threading.Thread(
+        target=process_magnet,
+        args=[notifier, magnet, None, None, None, None],
+    )
+    thread_list.append(t)
+    t.start()
+
+    # Remove buttons so the user can't double-click
+    try:
+        await interaction.response.edit_message(view=None)
+    except Exception:
+        pass
+    try:
+        await interaction.followup.send(f'🔄 任務 `{task_id}` 已重新加入佇列')
+    except Exception:
+        pass
+
+
+async def _handle_dismiss_click(interaction: discord.Interaction):
+    try:
+        await interaction.response.edit_message(view=None)
+    except Exception:
+        try:
+            await interaction.response.send_message('已忽略', ephemeral=True)
+        except Exception:
+            pass
+
+
 def _register_commands(bot: commands.Bot):
     """Wire all slash commands onto the bot's tree. Called once before run()."""
+
+    @bot.listen('on_interaction')
+    async def on_component(interaction: discord.Interaction):
+        # We only care about component (button) interactions. Slash commands are
+        # handled by the default app_commands dispatcher in parallel.
+        if interaction.type != discord.InteractionType.component:
+            return
+        data = interaction.data or {}
+        custom_id = data.get('custom_id') or ''
+        if custom_id.startswith('retry:'):
+            await _handle_retry_click(interaction, custom_id.split(':', 1)[1])
+        elif custom_id.startswith('dismiss:'):
+            await _handle_dismiss_click(interaction)
+
 
     @bot.tree.command(name='help', description='指令說明')
     async def help_cmd(interaction: discord.Interaction):
