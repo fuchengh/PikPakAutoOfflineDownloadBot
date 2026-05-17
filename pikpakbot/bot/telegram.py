@@ -12,6 +12,7 @@ from telegram.ext import CallbackContext, CommandHandler, Handler, MessageHandle
 import config
 from config import ADMIN_IDS, USER, PASSWORD, AUTO_DELETE, record_config
 from pikpakbot import state
+from pikpakbot.notifier import TelegramNotifier
 from pikpakbot.pikpak_client import (
     login,
     registerFuc,
@@ -121,10 +122,11 @@ def pikpak(update: Update, context: CallbackContext):
                 'results': []
             }
 
+        notifier = TelegramNotifier(context.bot, update.effective_chat.id)
         for each_magnet in argv:
             thread_list.append(threading.Thread(
                 target=process_magnet,
-                args=[update, context, each_magnet, offline_path, batch_id]
+                args=[notifier, each_magnet, offline_path, batch_id]
             ))
             thread_list[-1].start()
 
@@ -504,8 +506,9 @@ def retry(update: Update, context: CallbackContext):
     total_fail = 0
     all_results = []
 
+    notifier = TelegramNotifier(context.bot, update.effective_chat.id)
     for account in USER:
-        success, fail, results = retry_stuck_tasks(account, min_progress, delete_cloud_files=True)
+        success, fail, results = retry_stuck_tasks(account, min_progress, delete_cloud_files=True, notifier=notifier)
         total_success += success
         total_fail += fail
         if results:

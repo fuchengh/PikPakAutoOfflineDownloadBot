@@ -516,17 +516,23 @@ def get_stuck_tasks(account, min_progress=90):
     return stuck
 
 
-def retry_stuck_tasks(account, min_progress=90, delete_cloud_files=True):
+def retry_stuck_tasks(account, min_progress=90, delete_cloud_files=True, notifier=None):
     """
     找出並重試卡住的任務
     1. 找出進度 >= min_progress 但未完成的任務
     2. 刪除這些任務的雲端檔案 (可選)
     3. 使用 PikPak 的 RETRY 功能重新開始
 
+    notifier 會傳給 spawn 出來的 process_magnet 線程，讓後續通知去對的地方。
+
     返回: (success_count, fail_count, results)
     """
     # 延遲導入以避免循環依賴 (pipeline 需要 pikpak_client)
     from pikpakbot.pipeline import process_magnet, thread_list
+    from pikpakbot.notifier import NullNotifier
+
+    if notifier is None:
+        notifier = NullNotifier()
 
     stuck_tasks = get_stuck_tasks(account, min_progress)
 
@@ -570,7 +576,7 @@ def retry_stuck_tasks(account, min_progress=90, delete_cloud_files=True):
             }
             thread_list.append(threading.Thread(
                 target=process_magnet,
-                args=[None, None, None, None, None, task_info, account]
+                args=[notifier, None, None, None, task_info, account]
             ))
             thread_list[-1].start()
             logging.info(f"  ↳ 已啟動監控線程，等待完成後將推送 Aria2")

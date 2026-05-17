@@ -4,13 +4,11 @@ import threading
 from time import sleep, time
 
 import requests
-from telegram import Update
-from telegram.ext import CallbackContext
 
-from config import ADMIN_IDS, USER, AUTO_DELETE, ARIA2_DOWNLOAD_PATH
-from pikpakbot import updater
+from config import USER, AUTO_DELETE, ARIA2_DOWNLOAD_PATH
 from pikpakbot import aria2_client
 from pikpakbot import state
+from pikpakbot.notifier import Notifier, NullNotifier
 from pikpakbot.pikpak_client import (
     magnet_upload,
     get_offline_list,
@@ -25,7 +23,7 @@ batch_lock = threading.Lock()
 batch_results = {}
 
 
-def record_batch_result(batch_id, status, name, message, update, context):
+def record_batch_result(batch_id, status, name, message, notifier: Notifier):
     global batch_results
     if not batch_id:
         return
@@ -58,17 +56,16 @@ def record_batch_result(batch_id, status, name, message, update, context):
                 if res['message']:
                     summary += f"   └ {res['message']}\n"
 
-            if context and update and update.effective_chat:
-                try:
-                    context.bot.send_message(chat_id=update.effective_chat.id, text=summary, parse_mode='HTML')
-                except Exception as e:
-                    logging.error(f"發送匯總通知失敗: {e}")
+            notifier.send(summary, parse_mode='HTML')
 
             del batch_results[batch_id]
 
 
-def process_magnet(update: Update, context: CallbackContext, magnet, offline_path=None, batch_id=None,
+def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
                    resume_task=None, target_account=None):
+    if notifier is None:
+        notifier = NullNotifier()
+
     mag_url_simple = magnet
     if resume_task:
         mag_url_simple = f"恢復任務: {resume_task.get('name', 'Unknown')}"
@@ -86,16 +83,6 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
         )
     else:
         task_id = state.create_task(magnet=magnet, stage=state.STAGE_QUEUED)
-
-    def safe_send_message(text, parse_mode=None):
-        try:
-            if context and update and update.effective_chat:
-                context.bot.send_message(chat_id=update.effective_chat.id, text=text, parse_mode=parse_mode)
-            else:
-                if ADMIN_IDS:
-                    updater.bot.send_message(chat_id=ADMIN_IDS[0], text=text, parse_mode=parse_mode)
-        except Exception as e:
-            logging.error(f"Failed to send Telegram message: {e}")
 
     try:
         for each_account in USER:
@@ -124,9 +111,9 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
             if not mag_id:
                 if each_account == USER[-1]:
                     print_info = f'{mag_url_simple}所有帳號均離線下載失敗！可能是所有帳號免費離線次數用盡，或者檔案大小超過雲端硬碟剩餘容量！'
-                    safe_send_message(print_info)
+                    notifier.send(print_info)
                     logging.warning(print_info)
-                    record_batch_result(batch_id, 'fail', mag_url_simple, "所有帳號離線失敗", update, context)
+                    record_batch_result(batch_id, 'fail', mag_url_simple, "所有帳號離線失敗", notifier)
                     state.update_task(task_id, stage=state.STAGE_FAILED, error="所有帳號離線失敗")
                     return
                 continue
@@ -156,14 +143,14 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
                                 done = True
                                 file_id = each_down['file_id']
                                 print_info = f'帳號{each_account}離線下載磁力已完成：\n{mag_url_simple}\n檔案名稱：{mag_name}'
-                                safe_send_message(print_info)
+                                notifier.send(print_info)
                                 logging.info(print_info)
                             elif each_down['progress'] == 100:
                                 done = True
                                 file_id = each_down['file_id']
                                 print_info = f'帳號{each_account}離線下載磁力已完成:\n{mag_url_simple}\n但含有訊息：' \
                                              f'{msg.strip()}！\n檔案名稱：{mag_name}'
-                                safe_send_message(print_info)
+                                notifier.send(print_info)
                                 logging.warning(print_info)
                             else:
                                 current_file_name = each_down.get('file_name') or each_down.get('name') or mag_name or mag_url_simple
@@ -177,7 +164,7 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
                         not_found_count += 1
                         if not_found_count >= 5:
                             print_info = f'帳號{each_account}離線下載{mag_url_simple}的任務被取消（或多次查詢未找到）！'
-                            safe_send_message(print_info)
+                            notifier.send(print_info)
                             logging.warning(print_info)
                             state.update_task(task_id, stage=state.STAGE_FAILED, error="離線任務被取消或多次查詢未找到")
                             break
@@ -193,16 +180,16 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
             if (find and done) or (not find and not done):
                 if not done:
                     record_batch_result(batch_id, 'fail', mag_name if mag_name else mag_url_simple,
-                                        "離線任務被取消或失敗", update, context)
+                                        "離線任務被取消或失敗", notifier)
                     state.update_task(task_id, stage=state.STAGE_FAILED, error="離線任務被取消或失敗")
                     return
                 break
             elif find and not done:
                 print_info = f'帳號{each_account}離線下載{mag_url_simple}的任務超時（1小時）！已取消該任務！'
-                safe_send_message(print_info)
+                notifier.send(print_info)
                 logging.warning(print_info)
                 record_batch_result(batch_id, 'fail', mag_name if mag_name else mag_url_simple,
-                                    "離線下載超時", update, context)
+                                    "離線下載超時", notifier)
                 state.update_task(task_id, stage=state.STAGE_FAILED, error="離線下載超時（1小時）")
                 return
             else:
@@ -235,14 +222,14 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
                             continue
                     if not push_flag:
                         print_info = f'{name}推送aria2下載失敗！該檔案直連如下，請手動下載：\n{url}'
-                        safe_send_message(print_info)
+                        notifier.send(print_info)
                         logging.error(print_info)
                         continue
 
                     gid[response['result']] = [f'{name}', down_file_id, url]
                     logging.info(f'{path}{name}推送aria2下載')
 
-                safe_send_message(f'資料夾已推送aria2下載：\n{down_name}\n請耐心等待...')
+                notifier.send(f'資料夾已推送aria2下載：\n{down_name}\n請耐心等待...')
                 logging.info(f'{down_name}資料夾下所有檔案已推送aria2下載，請耐心等待...')
 
             else:
@@ -268,14 +255,14 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
 
                 if not push_flag:
                     print_info = f'{down_name}推送aria2下載失敗（多次重試無效）！該檔案直連如下，請手動下載：\n{down_url}'
-                    safe_send_message(print_info)
+                    notifier.send(print_info)
                     logging.error(print_info)
-                    record_batch_result(batch_id, 'fail', down_name, "推送Aria2失敗", update, context)
+                    record_batch_result(batch_id, 'fail', down_name, "推送Aria2失敗", notifier)
                     state.update_task(task_id, name=down_name, stage=state.STAGE_FAILED, error="推送Aria2失敗")
                     return
 
                 gid[response['result']] = [down_name, file_id, down_url]
-                safe_send_message(f'檔案已推送aria2下載：\n{down_name}\n請耐心等待...')
+                notifier.send(f'檔案已推送aria2下載：\n{down_name}\n請耐心等待...')
                 logging.info(f'{down_name}已推送aria2下載，請耐心等待...')
 
             state.update_task(task_id, name=down_name, stage=state.STAGE_DOWNLOAD, progress=0)
@@ -324,7 +311,7 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
                                         continue
                                 if not repush_flag:
                                     print_info = f'{retry_down_name}下載異常後重新推送失敗！該檔案直連如下，請手動下載：\n{retry_the_url}'
-                                    safe_send_message(print_info)
+                                    notifier.send(print_info)
                                     logging.error(print_info)
                                     failed_gid[each_gid] = temp_gid.pop(each_gid)
                                     continue
@@ -336,12 +323,12 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
                             else:
                                 print_info = f'aria2下載{gid[each_gid][0]}出錯！錯誤訊息：{error_message}\t該檔案直連如下，' \
                                              f'請手動下載並反饋bug：\n{gid[each_gid][2]}'
-                                safe_send_message(print_info)
+                                notifier.send(print_info)
                                 logging.warning(print_info)
                                 failed_gid[each_gid] = temp_gid.pop(each_gid)
 
                     except KeyError:
-                        safe_send_message(f'aria2下載{gid[each_gid][0]}任務被刪除！')
+                        notifier.send(f'aria2下載{gid[each_gid][0]}任務被刪除！')
                         logging.warning(f'aria2下載{gid[each_gid][0]}任務被刪除！')
                         failed_gid[each_gid] = temp_gid.pop(each_gid)
 
@@ -383,15 +370,15 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
                         else:
                             print_info += f'帳號{each_account}中下載成功的雲端硬碟檔案刪除失敗，請手動刪除\n'
 
-                        safe_send_message(print_info)
+                        notifier.send(print_info)
                         logging.info(print_info)
 
                         print_info = f'對於下載失敗的檔案可使用指令：\n`/clean {each_account}`清空此帳號下所有檔案\n~~或者使用臨時指令：~~' \
                                      f'\n~~`/download {each_account}`重試下載此帳號下所有檔案~~'
-                        safe_send_message(print_info, parse_mode='Markdown')
+                        notifier.send(print_info, parse_mode='Markdown')
                         logging.info(print_info)
                         record_batch_result(batch_id, 'fail', down_name,
-                                            f"部分檔案下載失敗: {len(failed_gid)}個", update, context)
+                                            f"部分檔案下載失敗: {len(failed_gid)}個", notifier)
                         state.update_task(task_id, stage=state.STAGE_FAILED,
                                           error=f"部分檔案下載失敗: {len(failed_gid)}個")
                     else:
@@ -417,10 +404,10 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
                             print_info += f'\n帳號{each_account}未開啟自動刪除'
                         else:
                             print_info += f'\n帳號{each_account}中該檔案的雲端硬碟空間釋放失敗，請手動刪除'
-                        safe_send_message(print_info)
+                        notifier.send(print_info)
                         logging.info(print_info)
 
-                        record_batch_result(batch_id, 'success', down_name, "", update, context)
+                        record_batch_result(batch_id, 'success', down_name, "", notifier)
                         state.update_task(task_id, stage=state.STAGE_COMPLETE)
                 else:
                     logging.info(f'aria2下載{down_name}還未完成，睡眠20s後進行下一次查詢...')
@@ -430,7 +417,7 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
         logging.warning(f'下載磁力{mag_url_simple}期間發生網路請求超時，但任務可能仍在進行中。')
     except Exception as e:
         logging.error(f"處理磁力{mag_url_simple}時發生未知錯誤: {e}")
-        record_batch_result(batch_id, 'fail', mag_url_simple, f"發生未知錯誤: {str(e)}", update, context)
+        record_batch_result(batch_id, 'fail', mag_url_simple, f"發生未知錯誤: {str(e)}", notifier)
         state.update_task(task_id, stage=state.STAGE_FAILED, error=f"未知錯誤: {e}")
     finally:
         # Safety net: if process_magnet exits and the task is still in a
@@ -449,7 +436,7 @@ def check_download_thread_status():
         return False
 
 
-def startup_recovery():
+def startup_recovery(admin_notifier: Notifier):
     """Bot 啟動時檢查是否有未完成的任務並恢復監控"""
     logging.info("正在檢查是否有未完成的任務需要恢復...")
     try:
@@ -471,7 +458,7 @@ def startup_recovery():
                     }
                     thread_list.append(threading.Thread(
                         target=process_magnet,
-                        args=[None, None, None, None, None, task_info, account]
+                        args=[admin_notifier, None, None, None, task_info, account]
                     ))
                     thread_list[-1].start()
                     resumed_count += 1
@@ -487,7 +474,7 @@ STUCK_WATCHDOG_INTERVAL_SECONDS = 20 * 60
 STUCK_WATCHDOG_PROGRESS_THRESHOLD = 99
 
 
-def stuck_task_watchdog():
+def stuck_task_watchdog(admin_notifier: Notifier):
     """
     Background thread: periodically retry tasks left near 100% indefinitely.
     PikPak occasionally leaves offline tasks at 99% without completing; this
@@ -507,6 +494,7 @@ def stuck_task_watchdog():
                     account,
                     min_progress=STUCK_WATCHDOG_PROGRESS_THRESHOLD,
                     delete_cloud_files=True,
+                    notifier=admin_notifier,
                 )
                 if success or fail:
                     logging.info(f"自動重試卡住任務 ({account}): 成功 {success}, 失敗 {fail}")
