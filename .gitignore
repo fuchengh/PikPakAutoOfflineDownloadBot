@@ -12,3 +12,10 @@ aria2-config/
 .venv/
 __pycache__/
 *.pyc
+
+# Local task state DB
+state.db
+state.db-journal
+state.db-wal
+state.db-shm
+debuglog.txt

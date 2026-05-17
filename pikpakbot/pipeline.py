@@ -10,6 +10,7 @@ from telegram.ext import CallbackContext
 from config import ADMIN_IDS, USER, AUTO_DELETE, ARIA2_DOWNLOAD_PATH
 from pikpakbot import updater
 from pikpakbot import aria2_client
+from pikpakbot import state
 from pikpakbot.pikpak_client import (
     magnet_upload,
     get_offline_list,
@@ -75,6 +76,17 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
         mag_url_part = re.search(r'^(magnet:\?).*(xt=.+?)(&|$)', magnet)
         mag_url_simple = ''.join(mag_url_part.groups()[:-1])
 
+    # Register task for /status & /history. Resume tasks start mid-pipeline.
+    if resume_task:
+        task_id = state.create_task(
+            magnet=None,
+            name=resume_task.get('name'),
+            account=target_account,
+            stage=state.STAGE_OFFLINE,
+        )
+    else:
+        task_id = state.create_task(magnet=magnet, stage=state.STAGE_QUEUED)
+
     def safe_send_message(text, parse_mode=None):
         try:
             if context and update and update.effective_chat:
@@ -115,9 +127,11 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
                     safe_send_message(print_info)
                     logging.warning(print_info)
                     record_batch_result(batch_id, 'fail', mag_url_simple, "所有帳號離線失敗", update, context)
+                    state.update_task(task_id, stage=state.STAGE_FAILED, error="所有帳號離線失敗")
                     return
                 continue
 
+            state.update_task(task_id, name=mag_name, account=each_account, stage=state.STAGE_OFFLINE)
             done = False
             logging.info('5s後將檢查離線下載進度...')
             sleep(5)
@@ -156,6 +170,7 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
                                 logging.info(
                                     f'帳號{each_account}離線下載 "{current_file_name}" 還未完成，進度{each_down["progress"]}%...'
                                 )
+                                state.update_task(task_id, progress=int(each_down["progress"]))
                                 sleep(10)
                             break
                     if not find:
@@ -164,6 +179,7 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
                             print_info = f'帳號{each_account}離線下載{mag_url_simple}的任務被取消（或多次查詢未找到）！'
                             safe_send_message(print_info)
                             logging.warning(print_info)
+                            state.update_task(task_id, stage=state.STAGE_FAILED, error="離線任務被取消或多次查詢未找到")
                             break
                         else:
                             logging.warning(f"帳號{each_account}未找到任務{mag_id}，重試({not_found_count}/5)...")
@@ -178,6 +194,7 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
                 if not done:
                     record_batch_result(batch_id, 'fail', mag_name if mag_name else mag_url_simple,
                                         "離線任務被取消或失敗", update, context)
+                    state.update_task(task_id, stage=state.STAGE_FAILED, error="離線任務被取消或失敗")
                     return
                 break
             elif find and not done:
@@ -186,6 +203,7 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
                 logging.warning(print_info)
                 record_batch_result(batch_id, 'fail', mag_name if mag_name else mag_url_simple,
                                     "離線下載超時", update, context)
+                state.update_task(task_id, stage=state.STAGE_FAILED, error="離線下載超時（1小時）")
                 return
             else:
                 continue
@@ -253,12 +271,14 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
                     safe_send_message(print_info)
                     logging.error(print_info)
                     record_batch_result(batch_id, 'fail', down_name, "推送Aria2失敗", update, context)
+                    state.update_task(task_id, name=down_name, stage=state.STAGE_FAILED, error="推送Aria2失敗")
                     return
 
                 gid[response['result']] = [down_name, file_id, down_url]
                 safe_send_message(f'檔案已推送aria2下載：\n{down_name}\n請耐心等待...')
                 logging.info(f'{down_name}已推送aria2下載，請耐心等待...')
 
+            state.update_task(task_id, name=down_name, stage=state.STAGE_DOWNLOAD, progress=0)
             logging.info(f'睡眠30s，之後將開始查詢{down_name}下載進度...')
             sleep(30)
             download_done = False
@@ -332,6 +352,7 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
                                  f'其中{len(complete_file_id)}個成功，{len(failed_gid)}個失敗'
 
                     logging.info(f"Aria2下載完成，準備清理PikPak檔案... (成功: {len(complete_file_id)}, 失敗: {len(failed_gid)})")
+                    state.update_task(task_id, stage=state.STAGE_CLEANUP, progress=100)
                     sleep(2)
 
                     if len(failed_gid):
@@ -371,6 +392,8 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
                         logging.info(print_info)
                         record_batch_result(batch_id, 'fail', down_name,
                                             f"部分檔案下載失敗: {len(failed_gid)}個", update, context)
+                        state.update_task(task_id, stage=state.STAGE_FAILED,
+                                          error=f"部分檔案下載失敗: {len(failed_gid)}個")
                     else:
                         status_a = False
                         status_b = False
@@ -398,6 +421,7 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
                         logging.info(print_info)
 
                         record_batch_result(batch_id, 'success', down_name, "", update, context)
+                        state.update_task(task_id, stage=state.STAGE_COMPLETE)
                 else:
                     logging.info(f'aria2下載{down_name}還未完成，睡眠20s後進行下一次查詢...')
                     sleep(20)
@@ -407,6 +431,12 @@ def process_magnet(update: Update, context: CallbackContext, magnet, offline_pat
     except Exception as e:
         logging.error(f"處理磁力{mag_url_simple}時發生未知錯誤: {e}")
         record_batch_result(batch_id, 'fail', mag_url_simple, f"發生未知錯誤: {str(e)}", update, context)
+        state.update_task(task_id, stage=state.STAGE_FAILED, error=f"未知錯誤: {e}")
+    finally:
+        # Safety net: if process_magnet exits and the task is still in a
+        # non-terminal stage (e.g. interrupted, unexpected return path), mark
+        # it failed so /status / /history don't show it as forever-running.
+        state.mark_failed_if_not_terminal(task_id, "process_magnet ended without explicit terminal stage")
 
 
 def check_download_thread_status():

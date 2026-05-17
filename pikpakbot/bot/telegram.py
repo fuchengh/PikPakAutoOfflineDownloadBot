@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import threading
+import time
 import uuid
 
 import telegram
@@ -10,6 +11,7 @@ from telegram.ext import CallbackContext, CommandHandler, Handler, MessageHandle
 
 import config
 from config import ADMIN_IDS, USER, PASSWORD, AUTO_DELETE, record_config
+from pikpakbot import state
 from pikpakbot.pikpak_client import (
     login,
     registerFuc,
@@ -32,6 +34,32 @@ from pikpakbot.pipeline import (
 )
 
 
+_STAGE_LABELS = {
+    state.STAGE_QUEUED: '⏳ 待處理',
+    state.STAGE_OFFLINE: '☁️ PikPak 離線中',
+    state.STAGE_DOWNLOAD: '⬇️ Aria2 下載中',
+    state.STAGE_CLEANUP: '🧹 清理中',
+    state.STAGE_COMPLETE: '✅ 完成',
+    state.STAGE_FAILED: '❌ 失敗',
+    state.STAGE_CANCELED: '⛔ 已取消',
+}
+
+
+def _stage_label(stage):
+    return _STAGE_LABELS.get(stage, stage)
+
+
+def _age(ts):
+    delta = max(0, int(time.time() - ts))
+    if delta < 60:
+        return f'{delta}s'
+    if delta < 3600:
+        return f'{delta // 60}m'
+    if delta < 86400:
+        return f'{delta // 3600}h'
+    return f'{delta // 86400}d'
+
+
 # 用户限制：Stack Overflow 用户@Majid提供的方法
 # from: https://stackoverflow.com/questions/62466399/how-can-i-restrict-a-telegram-bots-use-to-some-users-only#answers-header
 class AdminHandler(Handler):
@@ -52,6 +80,8 @@ def start(update: Update, context: CallbackContext):
     context.bot.send_message(chat_id=update.effective_chat.id,
                              text="【指令簡介】\n"
                                   "/p\t自動離線+aria2下載+釋放雲端硬碟空間\n"
+                                  "/status\t查看目前進行中的任務\n"
+                                  "/history [n]\t查看最近 n 個任務記錄（預設 20）\n"
                                   "/account\t管理帳號（發送/account查看使用說明）\n"
                                   "/clean\t清空雲端硬碟+離線任務記錄（發送/clean查看使用說明）\n"
                                   "/path\t管理pikpak離線下載的路徑\n"
@@ -503,6 +533,60 @@ def retry(update: Update, context: CallbackContext):
     )
 
 
+def status(update: Update, context: CallbackContext):
+    """List currently in-flight tasks (any non-terminal stage)."""
+    tasks = state.list_active()
+    if not tasks:
+        context.bot.send_message(chat_id=update.effective_chat.id, text='✅ 目前沒有進行中的任務')
+        return
+
+    lines = [f'📋 <b>進行中任務 ({len(tasks)})</b>']
+    for t in tasks:
+        name = t.get('name') or '(尚未取得名稱)'
+        acc = (t.get('account') or '').split('@')[0] or '-'
+        prog = t.get('progress', 0) or 0
+        prog_str = f' {prog}%' if prog else ''
+        age = _age(t['created_at'])
+        lines.append(
+            f"\n<code>{t['task_id']}</code> {_stage_label(t['stage'])}{prog_str}"
+            f"\n  {name}"
+            f"\n  帳號: {acc} | 已花費 {age}"
+        )
+    context.bot.send_message(chat_id=update.effective_chat.id, text='\n'.join(lines), parse_mode='HTML')
+
+
+def history(update: Update, context: CallbackContext):
+    """List recent terminal-stage tasks (default last 20)."""
+    argv = context.args
+    limit = 20
+    if argv:
+        try:
+            limit = max(1, min(50, int(argv[0])))
+        except ValueError:
+            pass
+
+    tasks = state.list_recent(limit=limit)
+    if not tasks:
+        context.bot.send_message(chat_id=update.effective_chat.id, text='📜 沒有任務記錄')
+        return
+
+    lines = [f'📜 <b>最近 {len(tasks)} 個任務</b>']
+    for t in tasks:
+        name = t.get('name') or t.get('magnet') or '(unknown)'
+        if len(name) > 60:
+            name = name[:57] + '...'
+        acc = (t.get('account') or '').split('@')[0] or '-'
+        end_ts = t.get('completed_at') or t.get('updated_at')
+        age = _age(end_ts)
+        err = t.get('error')
+        line = f"{_stage_label(t['stage'])} <code>{t['task_id']}</code> {name} ({acc}) — {age} ago"
+        if err and t['stage'] == state.STAGE_FAILED:
+            line += f"\n  ↳ {err}"
+        lines.append(line)
+
+    context.bot.send_message(chat_id=update.effective_chat.id, text='\n'.join(lines), parse_mode='HTML')
+
+
 def register_handlers(dispatcher):
     """Register all Telegram handlers on the dispatcher (order preserved from monolith)."""
     start_handler = CommandHandler(['start', 'help'], start)
@@ -511,6 +595,8 @@ def register_handlers(dispatcher):
     account_handler = CommandHandler('account', account_manage)
     path_handler = CommandHandler('path', path)
     retry_handler = CommandHandler('retry', retry)
+    status_handler = CommandHandler('status', status)
+    history_handler = CommandHandler('history', history)
     magnet_handler = MessageHandler(Filters.regex('^magnet:\?xt=urn:btih:[0-9a-fA-F]{40,}.*$'), pikpak)
 
     dispatcher.add_handler(AdminHandler())
@@ -521,3 +607,5 @@ def register_handlers(dispatcher):
     dispatcher.add_handler(clean_handler)
     dispatcher.add_handler(path_handler)
     dispatcher.add_handler(retry_handler)
+    dispatcher.add_handler(status_handler)
+    dispatcher.add_handler(history_handler)
