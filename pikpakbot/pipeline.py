@@ -276,13 +276,19 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
             download_done = False
             complete_file_id = []
             failed_gid = {}
-            total_files = max(1, len(gid))  # snapshot for progress %
+            total_files = max(1, len(gid))  # snapshot for file-count display
+            # gid -> {completed: bytes, total: bytes}. Persists across iterations so
+            # finished files keep contributing to byte-weighted progress.
+            gid_bytes = {g: {'completed': 0, 'total': 0} for g in gid.keys()}
             while not download_done:
                 temp_gid = gid.copy()
                 status_counts = {}  # for diagnostic log after this iteration
                 for each_gid in gid.keys():
                     try:
-                        response = aria2_client.tell_status(each_gid, ["gid", "status", "errorMessage", "dir"])
+                        response = aria2_client.tell_status(
+                            each_gid,
+                            ["gid", "status", "errorMessage", "dir", "completedLength", "totalLength"],
+                        )
                     except requests.exceptions.ReadTimeout:
                         logging.warning(f'查詢GID{each_gid}時網路請求超時，將跳過此次查詢！')
                         status_counts['tell_status_timeout'] = status_counts.get('tell_status_timeout', 0) + 1
@@ -295,6 +301,14 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
                     try:
                         status = response['result']['status']
                         status_counts[status] = status_counts.get(status, 0) + 1
+                        # Track bytes for weighted progress (last-known values stick after pop).
+                        try:
+                            gid_bytes[each_gid] = {
+                                'completed': int(response['result'].get('completedLength', 0) or 0),
+                                'total': int(response['result'].get('totalLength', 0) or 0),
+                            }
+                        except (TypeError, ValueError):
+                            pass
                         if status == 'complete':
                             temp_gid.pop(each_gid)
                             complete_file_id.append(gid[each_gid][1])
@@ -426,11 +440,19 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
                         state.update_task(task_id, stage=state.STAGE_COMPLETE)
                 else:
                     done_count = len(complete_file_id) + len(failed_gid)
-                    aria_progress = int(done_count / total_files * 100)
+                    total_bytes = sum(b['total'] for b in gid_bytes.values())
+                    if total_bytes > 0:
+                        done_bytes = sum(b['completed'] for b in gid_bytes.values())
+                        aria_progress = int(done_bytes / total_bytes * 100)
+                        byte_summary = f', {done_bytes / 1e9:.2f}GB/{total_bytes / 1e9:.2f}GB'
+                    else:
+                        # Fallback when aria2 doesn't know any file sizes yet (rare).
+                        aria_progress = int(done_count / total_files * 100)
+                        byte_summary = ''
                     state.update_task(task_id, progress=aria_progress)
                     status_summary = ', '.join(f'{k}={v}' for k, v in sorted(status_counts.items())) or '(no responses)'
                     logging.info(
-                        f'aria2下載{down_name}還未完成 ({done_count}/{total_files} = {aria_progress}%) — '
+                        f'aria2下載{down_name}還未完成 ({done_count}/{total_files} files{byte_summary} = {aria_progress}%) — '
                         f'status: {status_summary}，睡眠20s後再查...'
                     )
                     sleep(20)
