@@ -14,11 +14,12 @@ shape as the TG path.
 import asyncio
 import logging
 import threading
+import time
 from typing import Optional
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 import config
 from config import USER, PASSWORD, AUTO_DELETE, record_config
@@ -89,6 +90,31 @@ async def _run_sync(func, *args, **kwargs):
     """Run a blocking sync function on the default executor."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+
+
+PRESENCE_UPDATE_SECONDS = 60
+PRESENCE_RECENT_WINDOW_SECONDS = 3600  # what 'recent failure' means
+
+
+def _build_presence_text():
+    """Snapshot of current bot state for the Discord activity line."""
+    actives = state.list_active()
+    one_hr_ago = time.time() - PRESENCE_RECENT_WINDOW_SECONDS
+    recent_fails = [
+        t for t in state.list_recent(limit=50, stage_filter=state.STAGE_FAILED)
+        if (t.get('completed_at') or 0) >= one_hr_ago
+    ]
+
+    if not actives and not recent_fails:
+        return '✅ 閒置中'
+
+    parts = []
+    if actives:
+        parts.append(f'⬇️ {len(actives)} 進行中')
+    if recent_fails:
+        parts.append(f'⚠️ {len(recent_fails)} 失敗(1h)')
+    text = ' / '.join(parts)
+    return text[:128]  # Discord activity name cap
 
 
 def _magnet_summary(magnet: str) -> str:
@@ -551,6 +577,14 @@ def start_discord(token: str):
     intents = discord.Intents.default()
     bot = commands.Bot(command_prefix='/', intents=intents, help_command=None)
 
+    @tasks.loop(seconds=PRESENCE_UPDATE_SECONDS)
+    async def update_presence_loop():
+        try:
+            text = await _run_sync(_build_presence_text)
+            await bot.change_presence(activity=discord.CustomActivity(name=text))
+        except Exception as e:
+            logging.warning(f'Discord presence 更新失敗: {e}')
+
     @bot.event
     async def on_ready():
         logging.info(f'Discord 已連接: {bot.user} (id={bot.user.id})')
@@ -559,6 +593,14 @@ def start_discord(token: str):
             logging.info(f'Discord: 同步了 {len(synced)} 個 slash command')
         except Exception as e:
             logging.error(f'Discord slash command 同步失敗: {e}')
+        # Push presence immediately so users see something right away, then
+        # let the loop take over.
+        try:
+            await bot.change_presence(activity=discord.CustomActivity(name=await _run_sync(_build_presence_text)))
+        except Exception as e:
+            logging.warning(f'初始 presence 設定失敗: {e}')
+        if not update_presence_loop.is_running():
+            update_presence_loop.start()
 
     @bot.event
     async def on_error(event, *args, **kwargs):
