@@ -30,6 +30,7 @@ from pikpakbot.pikpak_client import (
     registerFuc,
     pikpak_headers,
     get_folder_all,
+    get_list,
     get_stuck_tasks,
     retry_stuck_tasks,
     delete_files,
@@ -39,12 +40,25 @@ from pikpakbot.pikpak_client import (
 )
 from pikpakbot.pipeline import (
     process_magnet,
+    download_cloud_file,
     thread_list,
     batch_results,
     batch_lock,
     check_download_thread_status,
     cleanup_failed_download_dir,
 )
+
+
+def _human_size(n):
+    try:
+        n = int(n or 0)
+    except (TypeError, ValueError):
+        return '?'
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if n < 1024:
+            return f'{n:.0f}{unit}' if unit == 'B' else f'{n:.1f}{unit}'
+        n /= 1024
+    return f'{n:.1f}PB'
 
 
 _client: Optional[commands.Bot] = None
@@ -239,6 +253,8 @@ def _register_commands(bot: commands.Bot):
         await interaction.response.send_message(
             "**指令簡介**\n"
             "/p `<magnet>` — 自動離線+aria2下載+釋放雲端空間\n"
+            "/ls `[folder_id]` — 列出 PikPak 雲端內容\n"
+            "/dl `<file_id>` — 下載指定雲端檔案/資料夾到本機\n"
             "/status — 查看進行中任務\n"
             "/history `[n]` — 查看最近 n 個任務\n"
             "/clean `<mode>` — 清空雲端硬碟+離線記錄\n"
@@ -349,6 +365,83 @@ def _register_commands(bot: commands.Bot):
                 line += f"\n  ↳ {err}"
             lines.append(line)
         await interaction.response.send_message('\n'.join(lines)[:2000])
+
+    # ---- /ls ----
+    @bot.tree.command(name='ls', description='List PikPak cloud contents')
+    @app_commands.describe(folder_id='Folder ID (empty for root). Get from a previous /ls call.',
+                            account='Account email (default: first configured)')
+    @app_commands.autocomplete(account=_account_autocomplete)
+    async def ls_cmd(interaction: discord.Interaction,
+                     folder_id: Optional[str] = '',
+                     account: Optional[str] = None):
+        target_account = account if account in USER else (USER[0] if USER else None)
+        if not target_account:
+            await interaction.response.send_message('沒有設定帳號', ephemeral=True)
+            return
+        await interaction.response.defer()
+        folder = '' if (not folder_id or folder_id == 'root') else folder_id
+        files = await _run_sync(get_list, folder, target_account)
+        if not files:
+            await interaction.followup.send(
+                f'📁 (空) — folder=`{folder or "root"}`, account=`{target_account}`'
+            )
+            return
+
+        lines = [f'**📁 PikPak 雲端內容** (帳號: `{target_account}`)']
+        if folder:
+            lines[0] += f' folder=`{folder}`'
+        for f in files:
+            is_folder = f.get('kind') == 'drive#folder'
+            icon = '📁' if is_folder else '📄'
+            size = '' if is_folder else f' ({_human_size(f.get("size", 0))})'
+            lines.append(f'{icon} **{f["name"]}**{size}')
+            lines.append(f'   `{f["id"]}`')
+
+        msg = '\n'.join(lines)
+        if len(msg) > 1950:
+            msg = msg[:1950] + '\n\n... (truncated, drill in with /ls folder_id:<id>)'
+        await interaction.followup.send(msg)
+
+    # ---- /dl ----
+    @bot.tree.command(name='dl', description='Download a PikPak cloud file/folder to local')
+    @app_commands.describe(file_id='File or folder ID (from /ls)',
+                            account='Account email (default: first configured)')
+    @app_commands.autocomplete(account=_account_autocomplete)
+    async def dl_cmd(interaction: discord.Interaction,
+                     file_id: str,
+                     account: Optional[str] = None):
+        target_account = account if account in USER else (USER[0] if USER else None)
+        if not target_account:
+            await interaction.response.send_message('沒有設定帳號', ephemeral=True)
+            return
+        await interaction.response.defer()
+
+        # Thread-per-download, same UX as /p.
+        parent = interaction.channel
+        target_id = interaction.channel_id
+        if parent and hasattr(parent, 'create_thread'):
+            try:
+                th = await parent.create_thread(
+                    name=f'📥 dl:{file_id[:50]}'[:100],
+                    type=discord.ChannelType.public_thread,
+                    auto_archive_duration=1440,
+                )
+                target_id = th.id
+                try:
+                    await th.add_user(interaction.user)
+                except Exception as e:
+                    logging.warning(f'Discord thread add_user 失敗: {e}')
+            except Exception as e:
+                logging.warning(f'Discord thread 建立失敗，落回 channel: {e}')
+
+        notifier = DiscordNotifier(target_id)
+        t = threading.Thread(target=download_cloud_file, args=[notifier, file_id, target_account])
+        thread_list.append(t)
+        t.start()
+
+        await interaction.followup.send(
+            f'📥 已開始下載 PikPak file `{file_id}` (帳號 `{target_account}`)'
+        )
 
     # ---- /clean ----
     @bot.tree.command(name='clean', description='Clear cloud files / offline records')

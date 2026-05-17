@@ -579,6 +579,42 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
             logging.error(f"notifier.finalize failed: {e}")
 
 
+def download_cloud_file(notifier: Notifier, file_id, account):
+    """Manual /dl entry: pull an existing PikPak cloud file/folder to local.
+
+    Skips the offline phase entirely (the file is already in cloud) and goes
+    straight to the aria2 push + cleanup pipeline. Cloud deletion is scoped to
+    the given file_id, so concurrent /p flows or other /dl calls are unaffected.
+    """
+    if notifier is None:
+        notifier = NullNotifier()
+
+    task_id = state.create_task(
+        magnet=None,
+        account=account,
+        stage=state.STAGE_DOWNLOAD,
+    )
+    source_label = f'cloud:{file_id}'
+
+    try:
+        _run_aria2_phase(notifier, file_id, account, task_id, None, source_label)
+    except requests.exceptions.ReadTimeout:
+        logging.warning(f'下載 cloud file {file_id} 期間發生網路請求超時，但任務可能仍在進行中。')
+    except Exception as e:
+        logging.error(f"處理 cloud file {file_id} 時發生未知錯誤: {e}")
+        state.update_task(task_id, stage=state.STAGE_FAILED, error=f"未知錯誤: {e}")
+    finally:
+        state.mark_failed_if_not_terminal(task_id, "download_cloud_file ended without explicit terminal stage")
+        try:
+            row = state.get_task(task_id)
+            if row:
+                success = row['stage'] == state.STAGE_COMPLETE
+                display_name = row.get('name') or source_label
+                notifier.finalize(success=success, name=display_name)
+        except Exception as e:
+            logging.error(f"notifier.finalize failed: {e}")
+
+
 def check_download_thread_status():
     # In-place filter so other modules that imported `thread_list` keep seeing the same list.
     thread_list[:] = [t for t in thread_list if t.is_alive()]

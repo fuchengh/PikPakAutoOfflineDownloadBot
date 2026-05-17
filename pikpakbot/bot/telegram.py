@@ -18,6 +18,7 @@ from pikpakbot.pikpak_client import (
     registerFuc,
     pikpak_headers,
     get_folder_all,
+    get_list,
     get_stuck_tasks,
     retry_stuck_tasks,
     delete_files,
@@ -28,12 +29,25 @@ from pikpakbot.pikpak_client import (
 )
 from pikpakbot.pipeline import (
     process_magnet,
+    download_cloud_file,
     thread_list,
     batch_results,
     batch_lock,
     check_download_thread_status,
     cleanup_failed_download_dir,
 )
+
+
+def _human_size(n):
+    try:
+        n = int(n or 0)
+    except (TypeError, ValueError):
+        return '?'
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if n < 1024:
+            return f'{n:.0f}{unit}' if unit == 'B' else f'{n:.1f}{unit}'
+        n /= 1024
+    return f'{n:.1f}PB'
 
 
 _STAGE_LABELS = {
@@ -87,6 +101,8 @@ def start(update: Update, context: CallbackContext):
     context.bot.send_message(chat_id=update.effective_chat.id,
                              text="【指令簡介】\n"
                                   "/p\t自動離線+aria2下載+釋放雲端硬碟空間\n"
+                                  "/ls [folder_id]\t列出 PikPak 雲端內容\n"
+                                  "/dl <file_id>\t下載指定的雲端檔案/資料夾到本機\n"
                                   "/status\t查看目前進行中的任務\n"
                                   "/history [n]\t查看最近 n 個任務記錄（預設 20）\n"
                                   "/account\t管理帳號（發送/account查看使用說明）\n"
@@ -596,6 +612,77 @@ def history(update: Update, context: CallbackContext):
     context.bot.send_message(chat_id=update.effective_chat.id, text='\n'.join(lines), parse_mode='HTML')
 
 
+def ls_cmd(update: Update, context: CallbackContext):
+    """List PikPak cloud contents. Usage: /ls [folder_id] [account]"""
+    argv = context.args or []
+    folder_id = argv[0] if argv else ''
+    if folder_id == 'root':
+        folder_id = ''
+
+    account = USER[0] if USER else None
+    if len(argv) >= 2:
+        if argv[1] in USER:
+            account = argv[1]
+        else:
+            context.bot.send_message(chat_id=update.effective_chat.id, text=f'帳號 {argv[1]} 不存在')
+            return
+    if not account:
+        context.bot.send_message(chat_id=update.effective_chat.id, text='沒有設定帳號')
+        return
+
+    files = get_list(folder_id, account)
+    if not files:
+        context.bot.send_message(chat_id=update.effective_chat.id,
+                                 text=f'📁 (空) — folder_id=`{folder_id or "root"}`, account=`{account}`',
+                                 parse_mode='Markdown')
+        return
+
+    lines = [f'📁 *PikPak 雲端內容* (帳號: `{account}`)']
+    if folder_id:
+        lines[0] += f' folder=`{folder_id}`'
+    for f in files:
+        is_folder = f.get('kind') == 'drive#folder'
+        icon = '📁' if is_folder else '📄'
+        size = '' if is_folder else f' ({_human_size(f.get("size", 0))})'
+        lines.append(f'{icon} {f["name"]}{size}')
+        lines.append(f'   `{f["id"]}`')
+
+    msg = '\n'.join(lines)
+    if len(msg) > 4000:
+        msg = msg[:4000] + '\n\n... (truncated, use folder_id to drill in)'
+    context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode='Markdown')
+
+
+def dl_cmd(update: Update, context: CallbackContext):
+    """Download a specific PikPak cloud file/folder to local. Usage: /dl <file_id> [account]"""
+    argv = context.args or []
+    if not argv:
+        context.bot.send_message(chat_id=update.effective_chat.id,
+                                 text='【用法】\n`/dl <file_id> [account]`\n先用 `/ls` 取得 file_id',
+                                 parse_mode='Markdown')
+        return
+    file_id = argv[0]
+    account = USER[0] if USER else None
+    if len(argv) >= 2:
+        if argv[1] in USER:
+            account = argv[1]
+        else:
+            context.bot.send_message(chat_id=update.effective_chat.id, text=f'帳號 {argv[1]} 不存在')
+            return
+    if not account:
+        context.bot.send_message(chat_id=update.effective_chat.id, text='沒有設定帳號')
+        return
+
+    notifier = TelegramNotifier(context.bot, update.effective_chat.id)
+    t = threading.Thread(target=download_cloud_file, args=[notifier, file_id, account])
+    thread_list.append(t)
+    t.start()
+
+    context.bot.send_message(chat_id=update.effective_chat.id,
+                             text=f'📥 已開始下載 PikPak file `{file_id}` (帳號 `{account}`)',
+                             parse_mode='Markdown')
+
+
 def handle_callback(update: Update, context: CallbackContext):
     """Handle inline button clicks (e.g. [Retry] on failure messages)."""
     query = update.callback_query
@@ -664,6 +751,8 @@ def register_handlers(dispatcher):
     retry_handler = CommandHandler('retry', retry)
     status_handler = CommandHandler('status', status)
     history_handler = CommandHandler('history', history)
+    ls_handler = CommandHandler('ls', ls_cmd)
+    dl_handler = CommandHandler('dl', dl_cmd)
     magnet_handler = MessageHandler(Filters.regex('^magnet:\?xt=urn:btih:[0-9a-fA-F]{40,}.*$'), pikpak)
     callback_handler = CallbackQueryHandler(handle_callback)
 
@@ -677,4 +766,6 @@ def register_handlers(dispatcher):
     dispatcher.add_handler(retry_handler)
     dispatcher.add_handler(status_handler)
     dispatcher.add_handler(history_handler)
+    dispatcher.add_handler(ls_handler)
+    dispatcher.add_handler(dl_handler)
     dispatcher.add_handler(callback_handler)
