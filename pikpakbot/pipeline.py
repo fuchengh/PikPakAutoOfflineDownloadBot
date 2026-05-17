@@ -8,7 +8,12 @@ import requests
 from config import USER, AUTO_DELETE, ARIA2_DOWNLOAD_PATH
 from pikpakbot import aria2_client
 from pikpakbot import state
-from pikpakbot.notifier import Notifier, NullNotifier
+from pikpakbot.notifier import ActionButton, Notifier, NullNotifier
+
+
+def _retry_buttons(task_id):
+    """Standard [Retry] [Dismiss] button row for failure notifications."""
+    return [ActionButton('🔄 重試', 'retry', task_id), ActionButton('✖️ 忽略', 'dismiss', task_id)]
 from pikpakbot.pikpak_client import (
     magnet_upload,
     get_offline_list,
@@ -111,7 +116,7 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
             if not mag_id:
                 if each_account == USER[-1]:
                     print_info = f'{mag_url_simple}所有帳號均離線下載失敗！可能是所有帳號免費離線次數用盡，或者檔案大小超過雲端硬碟剩餘容量！'
-                    notifier.send(print_info)
+                    notifier.send(print_info, buttons=_retry_buttons(task_id))
                     logging.warning(print_info)
                     record_batch_result(batch_id, 'fail', mag_url_simple, "所有帳號離線失敗", notifier)
                     state.update_task(task_id, stage=state.STAGE_FAILED, error="所有帳號離線失敗")
@@ -164,7 +169,7 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
                         not_found_count += 1
                         if not_found_count >= 5:
                             print_info = f'帳號{each_account}離線下載{mag_url_simple}的任務被取消（或多次查詢未找到）！'
-                            notifier.send(print_info)
+                            notifier.send(print_info, buttons=_retry_buttons(task_id))
                             logging.warning(print_info)
                             state.update_task(task_id, stage=state.STAGE_FAILED, error="離線任務被取消或多次查詢未找到")
                             break
@@ -186,7 +191,7 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
                 break
             elif find and not done:
                 print_info = f'帳號{each_account}離線下載{mag_url_simple}的任務超時（1小時）！已取消該任務！'
-                notifier.send(print_info)
+                notifier.send(print_info, buttons=_retry_buttons(task_id))
                 logging.warning(print_info)
                 record_batch_result(batch_id, 'fail', mag_name if mag_name else mag_url_simple,
                                     "離線下載超時", notifier)
@@ -255,7 +260,7 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
 
                 if not push_flag:
                     print_info = f'{down_name}推送aria2下載失敗（多次重試無效）！該檔案直連如下，請手動下載：\n{down_url}'
-                    notifier.send(print_info)
+                    notifier.send(print_info, buttons=_retry_buttons(task_id))
                     logging.error(print_info)
                     record_batch_result(batch_id, 'fail', down_name, "推送Aria2失敗", notifier)
                     state.update_task(task_id, name=down_name, stage=state.STAGE_FAILED, error="推送Aria2失敗")
@@ -370,7 +375,7 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
                         else:
                             print_info += f'帳號{each_account}中下載成功的雲端硬碟檔案刪除失敗，請手動刪除\n'
 
-                        notifier.send(print_info)
+                        notifier.send(print_info, buttons=_retry_buttons(task_id))
                         logging.info(print_info)
 
                         print_info = f'對於下載失敗的檔案可使用指令：\n`/clean {each_account}`清空此帳號下所有檔案\n~~或者使用臨時指令：~~' \

@@ -7,7 +7,7 @@ import uuid
 
 import telegram
 from telegram import Update
-from telegram.ext import CallbackContext, CommandHandler, Handler, MessageHandler, Filters
+from telegram.ext import CallbackContext, CallbackQueryHandler, CommandHandler, Handler, MessageHandler, Filters
 
 import config
 from config import ADMIN_IDS, USER, PASSWORD, AUTO_DELETE, record_config
@@ -68,9 +68,14 @@ class AdminHandler(Handler):
         super().__init__(self.cb)
 
     def cb(self, update: telegram.Update, context):
-        update.message.reply_text('Unauthorized access')
+        if update.callback_query:
+            update.callback_query.answer('Unauthorized', show_alert=True)
+        elif update.message:
+            update.message.reply_text('Unauthorized access')
 
     def check_update(self, update: telegram.update.Update):
+        if update.callback_query:
+            return str(update.callback_query.from_user.id) not in ADMIN_IDS
         if update.message is None or str(update.message.from_user.id) not in ADMIN_IDS:
             return True
 
@@ -590,6 +595,55 @@ def history(update: Update, context: CallbackContext):
     context.bot.send_message(chat_id=update.effective_chat.id, text='\n'.join(lines), parse_mode='HTML')
 
 
+def handle_callback(update: Update, context: CallbackContext):
+    """Handle inline button clicks (e.g. [Retry] on failure messages)."""
+    query = update.callback_query
+    try:
+        query.answer()
+    except Exception:
+        pass
+
+    data = query.data or ''
+    if data.startswith('retry:'):
+        task_id = data.split(':', 1)[1]
+        task = state.get_task(task_id)
+        if not task:
+            try:
+                query.edit_message_reply_markup(reply_markup=None)
+                context.bot.send_message(chat_id=query.message.chat_id,
+                                         text=f'❌ 找不到任務 {task_id}')
+            except Exception:
+                pass
+            return
+
+        magnet = task.get('magnet')
+        if not magnet:
+            context.bot.send_message(chat_id=query.message.chat_id,
+                                     text=f'❌ 任務 {task_id} 沒有原始 magnet，無法重試（可能是 resume 任務）')
+            return
+
+        notifier = TelegramNotifier(context.bot, query.message.chat_id)
+        thread_list.append(threading.Thread(
+            target=process_magnet,
+            args=[notifier, magnet, None, None, None, None],
+        ))
+        thread_list[-1].start()
+
+        # Remove the buttons so the user can't double-click
+        try:
+            query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        context.bot.send_message(chat_id=query.message.chat_id,
+                                 text=f'🔄 任務 {task_id} 已重新加入佇列')
+
+    elif data.startswith('dismiss:'):
+        try:
+            query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+
 def register_handlers(dispatcher):
     """Register all Telegram handlers on the dispatcher (order preserved from monolith)."""
     start_handler = CommandHandler(['start', 'help'], start)
@@ -601,6 +655,7 @@ def register_handlers(dispatcher):
     status_handler = CommandHandler('status', status)
     history_handler = CommandHandler('history', history)
     magnet_handler = MessageHandler(Filters.regex('^magnet:\?xt=urn:btih:[0-9a-fA-F]{40,}.*$'), pikpak)
+    callback_handler = CallbackQueryHandler(handle_callback)
 
     dispatcher.add_handler(AdminHandler())
     dispatcher.add_handler(account_handler)
@@ -612,3 +667,4 @@ def register_handlers(dispatcher):
     dispatcher.add_handler(retry_handler)
     dispatcher.add_handler(status_handler)
     dispatcher.add_handler(history_handler)
+    dispatcher.add_handler(callback_handler)
