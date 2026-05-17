@@ -73,3 +73,57 @@ class NullNotifier:
     """Drop messages on the floor. For tests or callers that opt out of notifications."""
     def send(self, text, *, parse_mode=None, buttons=None):
         pass
+
+
+class DiscordNotifier:
+    """Schedules sends onto the Discord client's asyncio loop from sync code.
+
+    The bridge is fire-and-forget — sync callers don't block waiting for the
+    Discord API. If the client isn't ready yet (e.g. during bot boot), the
+    message is dropped with a warning.
+    """
+    def __init__(self, channel_id):
+        self.channel_id = int(channel_id) if channel_id else 0
+
+    def send(self, text, *, parse_mode=None, buttons=None):
+        # Lazy import to keep notifier.py importable when discord.py isn't installed.
+        from pikpakbot.bot import discord_bot
+
+        client = discord_bot.get_client()
+        if not client or not client.is_ready() or not self.channel_id:
+            logging.warning(
+                f"DiscordNotifier dropped message (client_ready={client.is_ready() if client else False}, "
+                f"channel={self.channel_id}): {text[:80]}"
+            )
+            return
+
+        import asyncio
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._send_async(client, text, buttons),
+                client.loop,
+            )
+        except Exception as e:
+            logging.error(f"DiscordNotifier scheduling failed: {e}")
+
+    async def _send_async(self, client, text, buttons):
+        try:
+            channel = client.get_channel(self.channel_id)
+            if channel is None:
+                channel = await client.fetch_channel(self.channel_id)
+        except Exception as e:
+            logging.error(f"DiscordNotifier: channel {self.channel_id} not found: {e}")
+            return
+
+        view = None
+        if buttons:
+            import discord
+            view = discord.ui.View(timeout=None)
+            for b in buttons:
+                view.add_item(discord.ui.Button(label=b.label, custom_id=b.callback_data))
+
+        # Discord caps a single message at 2000 chars.
+        try:
+            await channel.send(text[:2000], view=view)
+        except Exception as e:
+            logging.error(f"DiscordNotifier send failed: {e}")
