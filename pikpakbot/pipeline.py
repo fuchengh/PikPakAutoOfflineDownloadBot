@@ -276,6 +276,7 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
             download_done = False
             complete_file_id = []
             failed_gid = {}
+            total_files = max(1, len(gid))  # snapshot for progress %
             while not download_done:
                 temp_gid = gid.copy()
                 for each_gid in gid.keys():
@@ -415,7 +416,12 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
                         record_batch_result(batch_id, 'success', down_name, "", notifier)
                         state.update_task(task_id, stage=state.STAGE_COMPLETE)
                 else:
-                    logging.info(f'aria2下載{down_name}還未完成，睡眠20s後進行下一次查詢...')
+                    done_count = len(complete_file_id) + len(failed_gid)
+                    aria_progress = int(done_count / total_files * 100)
+                    state.update_task(task_id, progress=aria_progress)
+                    logging.info(
+                        f'aria2下載{down_name}還未完成 ({done_count}/{total_files} = {aria_progress}%)，睡眠20s後再查...'
+                    )
                     sleep(20)
 
     except requests.exceptions.ReadTimeout:
