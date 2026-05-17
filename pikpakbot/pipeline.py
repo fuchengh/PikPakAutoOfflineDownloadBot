@@ -451,3 +451,34 @@ def startup_recovery():
                 logging.info(f"已從帳號 {account} 恢復 {resumed_count} 個任務")
     except Exception as e:
         logging.error(f"啟動恢復任務失敗: {e}")
+
+
+STUCK_WATCHDOG_INTERVAL_SECONDS = 20 * 60
+STUCK_WATCHDOG_PROGRESS_THRESHOLD = 99
+
+
+def stuck_task_watchdog():
+    """
+    Background thread: periodically retry tasks left near 100% indefinitely.
+    PikPak occasionally leaves offline tasks at 99% without completing; this
+    removes the need to call /retry manually.
+    """
+    from pikpakbot.pikpak_client import retry_stuck_tasks
+
+    logging.info(
+        f"卡住任務自動重試已啟動 (每 {STUCK_WATCHDOG_INTERVAL_SECONDS // 60} 分鐘掃描，"
+        f"閾值 {STUCK_WATCHDOG_PROGRESS_THRESHOLD}%)"
+    )
+    while True:
+        sleep(STUCK_WATCHDOG_INTERVAL_SECONDS)
+        for account in USER:
+            try:
+                success, fail, _ = retry_stuck_tasks(
+                    account,
+                    min_progress=STUCK_WATCHDOG_PROGRESS_THRESHOLD,
+                    delete_cloud_files=True,
+                )
+                if success or fail:
+                    logging.info(f"自動重試卡住任務 ({account}): 成功 {success}, 失敗 {fail}")
+            except Exception as e:
+                logging.error(f"自動重試卡住任務時發生錯誤 (帳號 {account}): {e}")

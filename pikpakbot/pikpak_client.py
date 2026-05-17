@@ -12,9 +12,86 @@ from config import USER, PASSWORD, AUTO_DELETE
 PIKPAK_API_URL = "https://api-drive.mypikpak.com"
 PIKPAK_USER_URL = "https://user.mypikpak.com"
 
+DEFAULT_TIMEOUT = 30
+DEFAULT_MAX_ATTEMPTS = 3
+
 pikpak_headers = [None] * len(USER)
 pikpak_clients = [None] * len(USER)
 login_lock = threading.Lock()
+
+
+class PikPakError(Exception):
+    """Raised when a PikPak API call fails after exhausting retries."""
+
+
+def _pikpak_request(method, url, account, *, max_attempts=DEFAULT_MAX_ATTEMPTS,
+                    timeout=DEFAULT_TIMEOUT, **kwargs):
+    """
+    Make a PikPak HTTP request with automatic recovery.
+
+    Handles:
+      - Session expiry (error_code 16 or HTTP 401) -> re-login, retry (does not consume an attempt; one re-login per call).
+      - Transient network errors (ReadTimeout / ConnectionError) -> exponential backoff.
+      - Rate limit (HTTP 429 / body contains "too_frequent") -> longer backoff.
+
+    Returns (response, parsed_json_or_empty_dict).
+    Raises the last network exception (or PikPakError) if all attempts fail.
+
+    Caller still inspects the returned dict for application-level errors that
+    aren't auto-recoverable (e.g. error_description for unknown magnet).
+    """
+    last_exc = None
+    relogin_used = False
+
+    for attempt in range(max_attempts):
+        try:
+            login_headers = get_headers(account)
+            resp = requests.request(method, url, headers=login_headers, timeout=timeout, **kwargs)
+
+            try:
+                data = resp.json() if resp.content else {}
+            except ValueError:
+                data = {}
+
+            session_expired = (
+                resp.status_code == 401
+                or (isinstance(data, dict) and data.get('error_code') == 16)
+            )
+            if session_expired and not relogin_used:
+                logging.info(f"帳號{account}登入過期，正在重新登入")
+                login(account)
+                relogin_used = True
+                continue
+
+            body_text = resp.text if resp.status_code >= 400 else ''
+            rate_limited = (
+                resp.status_code == 429
+                or 'too_frequent' in body_text.lower()
+                or 'too frequent' in body_text.lower()
+            )
+            if rate_limited:
+                wait = 5 * (2 ** attempt)
+                logging.warning(
+                    f"帳號{account}被 PikPak 限流 (HTTP {resp.status_code})，{wait}s 後重試 ({attempt + 1}/{max_attempts})"
+                )
+                sleep(wait)
+                continue
+
+            return resp, data
+
+        except (requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectTimeout,
+                requests.exceptions.ConnectionError) as e:
+            last_exc = e
+            wait = 2 ** attempt
+            logging.warning(
+                f"帳號{account} {method} 請求失敗 ({attempt + 1}/{max_attempts}): {e}，{wait}s 後重試"
+            )
+            sleep(wait)
+
+    if last_exc:
+        raise last_exc
+    raise PikPakError(f"帳號{account} {method} {url} 重試 {max_attempts} 次後仍失敗")
 
 
 def registerFuc():
@@ -85,7 +162,6 @@ def get_clients(account):
 
 
 def magnet_upload(file_url, account, parent_id=None, offline_path=None):
-    login_headers = get_headers(account)
     client = get_clients(account)
     torrent_url = f"{PIKPAK_API_URL}/drive/v1/files"
     if offline_path:
@@ -101,17 +177,16 @@ def magnet_upload(file_url, account, parent_id=None, offline_path=None):
         "folder_type": "DOWNLOAD" if not parent_id else "",
         "parent_id": parent_id,
     }
-    torrent_result = requests.post(url=torrent_url, headers=login_headers, json=torrent_data, timeout=5).json()
+
+    try:
+        _resp, torrent_result = _pikpak_request('POST', torrent_url, account, json=torrent_data)
+    except Exception as e:
+        logging.error(f"帳號{account}提交離線下載任務失敗: {e}")
+        return None, None
 
     if "error" in torrent_result:
-        if torrent_result['error_code'] == 16:
-            logging.info(f"帳號{account}登入過期，正在重新登入")
-            login(account)
-            login_headers = get_headers(account)
-            torrent_result = requests.post(url=torrent_url, headers=login_headers, json=torrent_data, timeout=5).json()
-        else:
-            logging.error(f"帳號{account}提交離線下載任務失敗，錯誤訊息：{torrent_result['error_description']}")
-            return None, None
+        logging.error(f"帳號{account}提交離線下載任務失敗，錯誤訊息：{torrent_result.get('error_description')}")
+        return None, None
 
     file_url_part = re.search(r'^(magnet:\?).*(xt=.+?)(&|$)', file_url)
     if file_url_part:
@@ -124,22 +199,23 @@ def magnet_upload(file_url, account, parent_id=None, offline_path=None):
 
 
 def get_offline_list(account):
-    login_headers = get_headers(account)
     tasks = []
     next_page_token = ""
 
     while True:
-        offline_list_url = f"{PIKPAK_API_URL}/drive/v1/tasks?type=offline&page_token={next_page_token}&thumbnail_size=SIZE_LARGE&filters=%7B%7D&with=reference_resource"
-        offline_list_info = requests.get(url=offline_list_url, headers=login_headers, timeout=5).json()
+        offline_list_url = (
+            f"{PIKPAK_API_URL}/drive/v1/tasks?type=offline&page_token={next_page_token}"
+            "&thumbnail_size=SIZE_LARGE&filters=%7B%7D&with=reference_resource"
+        )
+        try:
+            _resp, offline_list_info = _pikpak_request('GET', offline_list_url, account)
+        except Exception as e:
+            logging.error(f"帳號{account}獲取離線任務失敗: {e}")
+            return tasks
+
         if "error" in offline_list_info:
-            if offline_list_info['error_code'] == 16:
-                logging.info(f"帳號{account}登入過期，正在重新登入")
-                login(account)
-                login_headers = get_headers(account)
-                continue
-            else:
-                logging.error(f"帳號{account}獲取離線任務失敗，錯誤訊息：{offline_list_info.get('error_description')}")
-                return tasks
+            logging.error(f"帳號{account}獲取離線任務失敗，錯誤訊息：{offline_list_info.get('error_description')}")
+            return tasks
 
         tasks.extend(offline_list_info.get('tasks', []))
 
@@ -151,67 +227,58 @@ def get_offline_list(account):
 
 
 def get_download_url(file_id, account):
-    for tries in range(3):
-        try:
-            login_headers = get_headers(account)
-            download_url = f"{PIKPAK_API_URL}/drive/v1/files/{file_id}?_magic=2021&thumbnail_size=SIZE_LARGE"
-            download_info = requests.get(url=download_url, headers=login_headers, timeout=5).json()
+    download_url = f"{PIKPAK_API_URL}/drive/v1/files/{file_id}?_magic=2021&thumbnail_size=SIZE_LARGE"
 
-            if "error" in download_info:
-                if download_info['error_code'] == 16:
-                    logging.info(f"帳號{account}登入過期，正在重新登入")
-                    login(account)
-                    login_headers = get_headers(account)
-                    download_info = requests.get(url=download_url, headers=login_headers, timeout=5).json()
+    try:
+        _resp, download_info = _pikpak_request('GET', download_url, account)
+    except Exception as e:
+        logging.error(f"帳號{account}獲取檔案下載資訊失敗: {e}")
+        return "", ""
 
-                if "error" in download_info:
-                    logging.error(f"帳號{account}獲取檔案下載資訊失敗，錯誤訊息：{download_info['error_description']}")
-                    sleep(2)
-                    continue
+    if "error" in download_info:
+        logging.error(f"帳號{account}獲取檔案下載資訊失敗，錯誤訊息：{download_info.get('error_description')}")
+        return "", ""
 
-            return download_info['name'], download_info['web_content_link']
-
-        except Exception as e:
-            logging.error(f'帳號{account}獲取檔案下載資訊失敗（第{tries + 1}/3次）：{e}')
-            sleep(2)
-            continue
-
-    return "", ""
+    return download_info['name'], download_info['web_content_link']
 
 
 def get_list(folder_id, account):
+    file_list = []
+    list_url = (
+        f"{PIKPAK_API_URL}/drive/v1/files?parent_id={folder_id}&thumbnail_size=SIZE_LARGE"
+        "&filters=%7B%22trashed%22:%7B%22eq%22:false%7D%7D"
+    )
+
     try:
-        file_list = []
-        login_headers = get_headers(account)
-        list_url = f"{PIKPAK_API_URL}/drive/v1/files?parent_id={folder_id}&thumbnail_size=SIZE_LARGE" + \
-                   "&filters=%7B%22trashed%22:%7B%22eq%22:false%7D%7D"
-        list_result = requests.get(url=list_url, headers=login_headers, timeout=5).json()
-        if "error" in list_result:
-            if list_result['error_code'] == 16:
-                logging.info(f"帳號{account}登入過期，正在重新登入")
-                login(account)
-                login_headers = get_headers(account)
-                list_result = requests.get(url=list_url, headers=login_headers, timeout=5).json()
-            else:
-                logging.error(f"帳號{account}獲取資料夾下檔案id失敗，錯誤訊息：{list_result['error_description']}")
-                return file_list
-
-        file_list += list_result['files']
-
-        while list_result['next_page_token'] != "":
-            list_url = f"{PIKPAK_API_URL}/drive/v1/files?parent_id={folder_id}&page_token=" + list_result[
-                'next_page_token'] + \
-                       "&thumbnail_size=SIZE_LARGE" + "&filters=%7B%22trashed%22:%7B%22eq%22:false%7D%7D "
-
-            list_result = requests.get(url=list_url, headers=login_headers, timeout=5).json()
-
-            file_list += list_result['files']
-
+        _resp, list_result = _pikpak_request('GET', list_url, account)
+    except Exception as e:
+        logging.error(f"帳號{account}獲取資料夾下檔案id失敗: {e}")
         return file_list
 
-    except Exception as e:
-        logging.error(f"帳號{account}獲取資料夾下檔案id失敗:{e}")
-        return []
+    if "error" in list_result:
+        logging.error(f"帳號{account}獲取資料夾下檔案id失敗，錯誤訊息：{list_result.get('error_description')}")
+        return file_list
+
+    file_list += list_result['files']
+
+    while list_result.get('next_page_token'):
+        list_url = (
+            f"{PIKPAK_API_URL}/drive/v1/files?parent_id={folder_id}&page_token={list_result['next_page_token']}"
+            "&thumbnail_size=SIZE_LARGE&filters=%7B%22trashed%22:%7B%22eq%22:false%7D%7D"
+        )
+        try:
+            _resp, list_result = _pikpak_request('GET', list_url, account)
+        except Exception as e:
+            logging.error(f"帳號{account}獲取資料夾下檔案id分頁失敗: {e}")
+            return file_list
+
+        if "error" in list_result:
+            logging.error(f"帳號{account}獲取資料夾下檔案id分頁失敗，錯誤訊息：{list_result.get('error_description')}")
+            return file_list
+
+        file_list += list_result.get('files', [])
+
+    return file_list
 
 
 def get_folder_all_file(folder_id, path, account):
@@ -241,6 +308,26 @@ def get_folder_all(account):
             yield a['id']
 
 
+def _batch_delete(file_id, account, endpoint, action_label):
+    delete_url = f"{PIKPAK_API_URL}{endpoint}"
+    if isinstance(file_id, list):
+        payload = {"ids": file_id}
+    else:
+        payload = {"ids": [file_id]}
+
+    try:
+        _resp, result = _pikpak_request('POST', delete_url, account, json=payload)
+    except Exception as e:
+        logging.error(f"帳號{account}{action_label}失敗: {e}")
+        return False
+
+    if "error" in result:
+        logging.error(f"帳號{account}{action_label}失敗，錯誤訊息：{result.get('error_description')}")
+        return False
+
+    return True
+
+
 def delete_files(file_id, account, mode='normal'):
     if mode == 'normal':
         if auto_delete_judge(account) == 'off':
@@ -248,26 +335,7 @@ def delete_files(file_id, account, mode='normal'):
             return False
         else:
             logging.info('帳號{}開啟了自動清理'.format(account))
-    login_headers = get_headers(account)
-    delete_files_url = f"{PIKPAK_API_URL}/drive/v1/files:batchTrash"
-    if type(file_id) == list:
-        delete_files_data = {"ids": file_id}
-    else:
-        delete_files_data = {"ids": [file_id]}
-    delete_files_result = requests.post(url=delete_files_url, headers=login_headers, json=delete_files_data,
-                                        timeout=5).json()
-    if "error" in delete_files_result:
-        if delete_files_result['error_code'] == 16:
-            logging.info(f"帳號{account}登入過期，正在重新登入")
-            login(account)
-            login_headers = get_headers(account)
-            delete_files_result = requests.post(url=delete_files_url, headers=login_headers, json=delete_files_data,
-                                                timeout=5).json()
-        else:
-            logging.error(f"帳號{account}刪除雲端硬碟檔案失敗，錯誤訊息：{delete_files_result['error_description']}")
-            return False
-
-    return True
+    return _batch_delete(file_id, account, "/drive/v1/files:batchTrash", "刪除雲端硬碟檔案")
 
 
 def delete_trash(file_id, account, mode='normal'):
@@ -277,26 +345,7 @@ def delete_trash(file_id, account, mode='normal'):
             return False
         else:
             logging.info('帳號{}開啟了自動清理'.format(account))
-    login_headers = get_headers(account)
-    delete_files_url = f"{PIKPAK_API_URL}/drive/v1/files:batchDelete"
-    if type(file_id) == list:
-        delete_files_data = {"ids": file_id}
-    else:
-        delete_files_data = {"ids": [file_id]}
-    delete_files_result = requests.post(url=delete_files_url, headers=login_headers, json=delete_files_data,
-                                        timeout=5).json()
-    if "error" in delete_files_result:
-        if delete_files_result['error_code'] == 16:
-            logging.info(f"帳號{account}登入過期，正在重新登入")
-            login(account)
-            login_headers = get_headers(account)
-            delete_files_result = requests.post(url=delete_files_url, headers=login_headers, json=delete_files_data,
-                                                timeout=5).json()
-        else:
-            logging.error(f"帳號{account}刪除垃圾桶檔案失敗，錯誤訊息：{delete_files_result['error_description']}")
-            return False
-
-    return True
+    return _batch_delete(file_id, account, "/drive/v1/files:batchDelete", "刪除垃圾桶檔案")
 
 
 def delete_offline_tasks(account, task_ids=None, delete_files_too=False, phase_filter=None):
@@ -309,8 +358,6 @@ def delete_offline_tasks(account, task_ids=None, delete_files_too=False, phase_f
 
     返回: (success_count, fail_count)
     """
-    login_headers = get_headers(account)
-
     if task_ids is None:
         tasks = get_offline_list(account)
         if phase_filter:
@@ -330,7 +377,6 @@ def delete_offline_tasks(account, task_ids=None, delete_files_too=False, phase_f
 
     for i in range(0, len(task_ids), batch_size):
         batch = task_ids[i:i + batch_size]
-
         delete_url = f"{PIKPAK_API_URL}/drive/v1/tasks"
         params = {
             "task_ids": ",".join(batch),
@@ -338,26 +384,13 @@ def delete_offline_tasks(account, task_ids=None, delete_files_too=False, phase_f
         }
 
         try:
-            result = requests.delete(url=delete_url, headers=login_headers, params=params, timeout=15)
-
-            if result.status_code == 200:
+            resp, _data = _pikpak_request('DELETE', delete_url, account, params=params)
+            if resp.status_code == 200:
                 success_count += len(batch)
                 logging.info(f"帳號{account}成功刪除 {len(batch)} 個離線任務記錄")
             else:
-                if result.status_code == 401 or 'error_code' in result.text:
-                    logging.info(f"帳號{account}登入過期，正在重新登入")
-                    login(account)
-                    login_headers = get_headers(account)
-                    result = requests.delete(url=delete_url, headers=login_headers, params=params, timeout=15)
-                    if result.status_code == 200:
-                        success_count += len(batch)
-                        logging.info(f"帳號{account}重試後成功刪除 {len(batch)} 個離線任務記錄")
-                    else:
-                        fail_count += len(batch)
-                        logging.error(f"帳號{account}刪除離線任務記錄失敗: {result.text}")
-                else:
-                    fail_count += len(batch)
-                    logging.error(f"帳號{account}刪除離線任務記錄失敗: {result.text}")
+                fail_count += len(batch)
+                logging.error(f"帳號{account}刪除離線任務記錄失敗: HTTP {resp.status_code} {resp.text}")
         except Exception as e:
             fail_count += len(batch)
             logging.error(f"帳號{account}刪除離線任務記錄時發生錯誤: {e}")
@@ -370,28 +403,20 @@ def delete_offline_tasks(account, task_ids=None, delete_files_too=False, phase_f
 
 def empty_trash(account):
     """清空回收站中的所有檔案"""
-    login_headers = get_headers(account)
     empty_url = f"{PIKPAK_API_URL}/drive/v1/files/trash:empty"
 
     try:
-        result = requests.post(url=empty_url, headers=login_headers, json={}, timeout=15)
-
-        if result.status_code == 200:
-            logging.info(f"帳號{account}回收站已清空")
-            return True
-        else:
-            if 'error_code' in result.text:
-                login(account)
-                login_headers = get_headers(account)
-                result = requests.post(url=empty_url, headers=login_headers, json={}, timeout=15)
-                if result.status_code == 200:
-                    logging.info(f"帳號{account}回收站已清空")
-                    return True
-            logging.error(f"帳號{account}清空回收站失敗: {result.text}")
-            return False
+        resp, _data = _pikpak_request('POST', empty_url, account, json={})
     except Exception as e:
         logging.error(f"帳號{account}清空回收站時發生錯誤: {e}")
         return False
+
+    if resp.status_code == 200:
+        logging.info(f"帳號{account}回收站已清空")
+        return True
+
+    logging.error(f"帳號{account}清空回收站失敗: HTTP {resp.status_code} {resp.text}")
+    return False
 
 
 def retry_offline_task(task_id, account):
@@ -399,7 +424,6 @@ def retry_offline_task(task_id, account):
     使用 PikPak 的 RETRY 功能重新開始離線任務
     這會讓 PikPak 重新嘗試下載，不需要原始 magnet link
     """
-    login_headers = get_headers(account)
     retry_url = f"{PIKPAK_API_URL}/drive/v1/task"
     retry_data = {
         "type": "offline",
@@ -408,23 +432,17 @@ def retry_offline_task(task_id, account):
     }
 
     try:
-        result = requests.post(url=retry_url, headers=login_headers, json=retry_data, timeout=10).json()
-
-        if "error" in result:
-            if result['error_code'] == 16:
-                logging.info(f"帳號{account}登入過期，正在重新登入")
-                login(account)
-                login_headers = get_headers(account)
-                result = requests.post(url=retry_url, headers=login_headers, json=retry_data, timeout=10).json()
-            else:
-                logging.error(f"帳號{account}重試任務失敗: {result.get('error_description', result)}")
-                return False, result.get('error_description', 'Unknown error')
-
-        logging.info(f"帳號{account}成功重試任務 {task_id}")
-        return True, result
+        _resp, result = _pikpak_request('POST', retry_url, account, json=retry_data)
     except Exception as e:
         logging.error(f"帳號{account}重試任務時發生錯誤: {e}")
         return False, str(e)
+
+    if "error" in result:
+        logging.error(f"帳號{account}重試任務失敗: {result.get('error_description', result)}")
+        return False, result.get('error_description', 'Unknown error')
+
+    logging.info(f"帳號{account}成功重試任務 {task_id}")
+    return True, result
 
 
 def delete_offline_task(task_ids, account, delete_files=False):
@@ -433,7 +451,6 @@ def delete_offline_task(task_ids, account, delete_files=False):
     task_ids: 單個 task_id 或 list of task_ids
     delete_files: 是否同時刪除雲端檔案
     """
-    login_headers = get_headers(account)
     delete_url = f"{PIKPAK_API_URL}/drive/v1/tasks"
 
     if isinstance(task_ids, str):
@@ -445,18 +462,17 @@ def delete_offline_task(task_ids, account, delete_files=False):
     }
 
     try:
-        result = requests.delete(url=delete_url, headers=login_headers, params=params, timeout=10)
-
-        if result.status_code == 200:
-            logging.info(f"帳號{account}成功刪除 {len(task_ids)} 個任務")
-            return True, None
-        else:
-            error_msg = result.text
-            logging.error(f"帳號{account}刪除任務失敗: {error_msg}")
-            return False, error_msg
+        resp, _data = _pikpak_request('DELETE', delete_url, account, params=params)
     except Exception as e:
         logging.error(f"帳號{account}刪除任務時發生錯誤: {e}")
         return False, str(e)
+
+    if resp.status_code == 200:
+        logging.info(f"帳號{account}成功刪除 {len(task_ids)} 個任務")
+        return True, None
+
+    logging.error(f"帳號{account}刪除任務失敗: HTTP {resp.status_code} {resp.text}")
+    return False, resp.text
 
 
 def get_stuck_tasks(account, min_progress=90):
@@ -582,23 +598,16 @@ def retry_stuck_tasks(account, min_progress=90, delete_cloud_files=True):
 
 
 def get_my_vip(account):
-    try:
-        login_headers = get_headers(account)
+    me_url = f"{PIKPAK_API_URL}/drive/v1/privilege/vip"
 
-        me_url = f"{PIKPAK_API_URL}/drive/v1/privilege/vip"
-        me_result = requests.get(url=me_url, headers=login_headers, timeout=5).json()
+    try:
+        _resp, me_result = _pikpak_request('GET', me_url, account)
     except Exception:
         return 3
 
     if "error" in me_result:
-        if me_result['error_code'] == 16:
-            logging.info(f"帳號{account}登入過期，正在重新登入")
-            login(account)
-            login_headers = get_headers(account)
-            me_result = requests.get(url=me_url, headers=login_headers, timeout=5).json()
-        else:
-            logging.error(f"獲取vip訊息失敗{me_result['error_description']}")
-            return 3
+        logging.error(f"獲取vip訊息失敗{me_result.get('error_description')}")
+        return 3
 
     if me_result['data']['status'] == 'ok':
         return 0

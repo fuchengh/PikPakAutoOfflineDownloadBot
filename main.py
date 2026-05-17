@@ -3,7 +3,7 @@ import threading
 
 from pikpakbot import updater, dispatcher
 from pikpakbot.bot.telegram import register_handlers
-from pikpakbot.pipeline import startup_recovery
+from pikpakbot.pipeline import startup_recovery, stuck_task_watchdog
 
 
 def _configure_logging():
@@ -20,8 +20,8 @@ def main():
     _configure_logging()
     register_handlers(dispatcher)
 
-    recovery_thread = threading.Thread(target=startup_recovery, daemon=True)
-    recovery_thread.start()
+    threading.Thread(target=startup_recovery, daemon=True).start()
+    threading.Thread(target=stuck_task_watchdog, daemon=True).start()
 
     updater.start_polling()
     updater.idle()
