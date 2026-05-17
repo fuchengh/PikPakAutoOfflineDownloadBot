@@ -436,6 +436,16 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
         # it failed so /status / /history don't show it as forever-running.
         state.mark_failed_if_not_terminal(task_id, "process_magnet ended without explicit terminal stage")
 
+        # Notify the bot-side hook so Discord threads can rename + archive.
+        try:
+            row = state.get_task(task_id)
+            if row:
+                success = row['stage'] == state.STAGE_COMPLETE
+                display_name = row.get('name') or mag_url_simple or 'task'
+                notifier.finalize(success=success, name=display_name)
+        except Exception as e:
+            logging.error(f"notifier.finalize failed: {e}")
+
 
 def check_download_thread_status():
     # In-place filter so other modules that imported `thread_list` keep seeing the same list.

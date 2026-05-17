@@ -36,6 +36,14 @@ class Notifier(Protocol):
              buttons: Optional[Iterable[ActionButton]] = None) -> None:
         ...
 
+    def finalize(self, *, success: bool, name: str) -> None:
+        """Called once when the task reaches a terminal stage.
+
+        Bot-specific cleanup hook. Discord uses it to rename + archive
+        threads. TG is a no-op (no per-task channel concept).
+        """
+        ...
+
 
 class TelegramNotifier:
     def __init__(self, bot, chat_id):
@@ -55,6 +63,10 @@ class TelegramNotifier:
         except Exception as e:
             logging.error(f"TelegramNotifier send failed: {e}")
 
+    def finalize(self, *, success, name):
+        # TG has no per-task channel; nothing to clean up.
+        pass
+
 
 class CompositeNotifier:
     """Fan out to multiple notifiers. One failing notifier doesn't block others."""
@@ -68,10 +80,21 @@ class CompositeNotifier:
             except Exception as e:
                 logging.error(f"CompositeNotifier sub-notifier {type(n).__name__} failed: {e}")
 
+    def finalize(self, *, success, name):
+        for n in self._notifiers:
+            try:
+                if hasattr(n, 'finalize'):
+                    n.finalize(success=success, name=name)
+            except Exception as e:
+                logging.error(f"CompositeNotifier finalize {type(n).__name__} failed: {e}")
+
 
 class NullNotifier:
     """Drop messages on the floor. For tests or callers that opt out of notifications."""
     def send(self, text, *, parse_mode=None, buttons=None):
+        pass
+
+    def finalize(self, *, success, name):
         pass
 
 
@@ -154,3 +177,47 @@ class DiscordNotifier:
             await channel.send(embed=embed, view=view)
         except Exception as e:
             logging.error(f"DiscordNotifier send failed: {e}")
+
+    def finalize(self, *, success, name):
+        """Rename + archive the bound thread (if any) when the task ends."""
+        from pikpakbot.bot import discord_bot
+
+        client = discord_bot.get_client()
+        if not client or not client.is_ready() or not self.channel_id:
+            return
+
+        import asyncio
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._finalize_async(client, success, name),
+                client.loop,
+            )
+        except Exception as e:
+            logging.error(f"DiscordNotifier finalize scheduling failed: {e}")
+
+    async def _finalize_async(self, client, success, name):
+        import discord
+        try:
+            channel = client.get_channel(self.channel_id)
+            if channel is None:
+                channel = await client.fetch_channel(self.channel_id)
+        except Exception as e:
+            logging.error(f"DiscordNotifier finalize: channel {self.channel_id} not found: {e}")
+            return
+
+        # Only act on threads — regular channels shouldn't be renamed/archived.
+        if not isinstance(channel, discord.Thread):
+            return
+
+        icon = '✅' if success else '❌'
+        new_name = f'{icon} {name}'[:100]  # Discord thread name cap
+        try:
+            if success:
+                # Rename and archive in one edit; archived threads are hidden from
+                # the active list but still browsable.
+                await channel.edit(name=new_name, archived=True)
+            else:
+                # Failure: rename but stay active so the retry buttons remain usable.
+                await channel.edit(name=new_name)
+        except Exception as e:
+            logging.error(f"DiscordNotifier finalize edit failed: {e}")

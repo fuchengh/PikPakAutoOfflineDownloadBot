@@ -177,6 +177,12 @@ async def _handle_dismiss_click(interaction: discord.Interaction):
             await interaction.response.send_message('已忽略', ephemeral=True)
         except Exception:
             pass
+    # If we're in a thread, archive it now that the user has dismissed the failure.
+    if isinstance(interaction.channel, discord.Thread):
+        try:
+            await interaction.channel.edit(archived=True)
+        except Exception as e:
+            logging.warning(f'Dismiss: archive thread 失敗: {e}')
 
 
 def _register_commands(bot: commands.Bot):
