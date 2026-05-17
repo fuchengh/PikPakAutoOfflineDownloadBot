@@ -133,3 +133,32 @@ def mark_failed_if_not_terminal(task_id, error_message):
         return
     update_task(task_id, stage=STAGE_FAILED, error=error_message)
     logging.info(f"任務 {task_id} 因例外被標記為失敗: {error_message}")
+
+
+def sweep_interrupted():
+    """At boot, mark all non-terminal tasks as failed.
+
+    process_magnet's `finally` block calls mark_failed_if_not_terminal, but
+    that only runs if python can unwind the thread normally. systemctl
+    restart sends SIGTERM and the threads die mid-execution, so any task
+    that was in OFFLINE/DOWNLOAD/CLEANUP when the bot died stays that way
+    in state.db forever. /status then shows phantom 'in progress' rows.
+
+    Preserves each task's original updated_at as completed_at so a task
+    interrupted weeks ago doesn't suddenly look like a 'recent failure' in
+    the presence/history views.
+
+    Returns the number of rows updated.
+    """
+    actives = list_active()
+    if not actives:
+        return 0
+    for t in actives:
+        completed_at = t.get('updated_at') or time.time()
+        update_task(
+            t['task_id'],
+            stage=STAGE_FAILED,
+            error='bot restarted while task was in flight',
+            completed_at=completed_at,
+        )
+    return len(actives)

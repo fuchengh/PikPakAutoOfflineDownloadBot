@@ -3,7 +3,7 @@ import threading
 
 import config
 from config import ADMIN_IDS
-from pikpakbot import updater, dispatcher
+from pikpakbot import updater, dispatcher, state
 from pikpakbot.bot.telegram import register_handlers
 from pikpakbot.notifier import CompositeNotifier, DiscordNotifier, NullNotifier, TelegramNotifier
 from pikpakbot.pipeline import startup_recovery, stuck_task_watchdog
@@ -50,6 +50,15 @@ def _build_admin_notifier(discord_enabled: bool):
 
 def main():
     _configure_logging()
+
+    # Clean up any state rows left in non-terminal stages by the previous run
+    # (bot was killed before threads could mark themselves failed). Do this
+    # before startup_recovery so /status doesn't show phantom 'in progress'
+    # entries during the boot sequence.
+    swept = state.sweep_interrupted()
+    if swept:
+        logging.info(f'啟動清理：將 {swept} 筆中斷的舊任務標記為失敗')
+
     register_handlers(dispatcher)
     discord_enabled = _maybe_start_discord()
 
