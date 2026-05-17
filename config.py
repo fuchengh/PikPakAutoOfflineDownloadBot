@@ -20,3 +20,25 @@ TG_API_URL = 'https://api.telegram.org'
 
 # 自定义Pikpak离线下载路径
 PIKPAK_OFFLINE_PATH = "None"
+
+
+def record_config():
+    import logging
+    import os
+
+    config_path = os.path.abspath(os.path.dirname(__file__)) + '/config.py'
+    with open(config_path, 'w') as f:
+        f.write(
+            f'TOKEN = "{TOKEN}"\n'
+            f'ADMIN_IDS = {ADMIN_IDS}\n'
+            f'USER = {USER}\n'
+            f'PASSWORD = {PASSWORD}\n'
+            f'AUTO_DELETE = {AUTO_DELETE}\n'
+            f'ARIA2_HTTPS = {ARIA2_HTTPS}\n'
+            f'ARIA2_HOST = "{ARIA2_HOST}"\n'
+            f'ARIA2_PORT = "{ARIA2_PORT}"\n'
+            f'ARIA2_SECRET = "{ARIA2_SECRET}"\n'
+            f'ARIA2_DOWNLOAD_PATH = "{ARIA2_DOWNLOAD_PATH}"\n'
+            f'TG_API_URL = "{TG_API_URL}"\n'
+            f'PIKPAK_OFFLINE_PATH = "{PIKPAK_OFFLINE_PATH}"\n')
+    logging.info('已更新config.py文件')
