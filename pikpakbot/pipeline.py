@@ -280,6 +280,10 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
             # gid -> {completed: bytes, total: bytes}. Persists across iterations so
             # finished files keep contributing to byte-weighted progress.
             gid_bytes = {g: {'completed': 0, 'total': 0} for g in gid.keys()}
+            # gid -> aria2-error retry count (file ID may stay the same across retries;
+            # we count by file_id since each repush yields a new gid).
+            ARIA_ERROR_MAX_RETRIES = 3
+            file_error_retries = {}  # pikpak_file_id -> int
             while not download_done:
                 temp_gid = gid.copy()
                 status_counts = {}  # for diagnostic log after this iteration
@@ -320,41 +324,69 @@ def process_magnet(notifier: Notifier, magnet, offline_path=None, batch_id=None,
                             failed_gid[each_gid] = temp_gid.pop(each_gid)
                         elif status == 'error':
                             error_message = response["result"]["errorMessage"]
-                            if error_message in ['No URI available.', 'SSL/TLS handshake failure: SSL I/O error']:
-                                retry_down_name, retry_the_url = get_download_url(gid[each_gid][1], each_account)
-                                repush_flag = False
-                                for tries in range(5):
-                                    try:
-                                        response = aria2_client.add_uri(retry_the_url, response["result"]["dir"],
-                                                                        retry_down_name, download_headers)
-                                        repush_flag = True
-                                        break
-                                    except requests.exceptions.ReadTimeout:
-                                        logging.warning(
-                                            f'{retry_down_name}下載異常後重新推送第{tries + 1}(/5)次網路請求超時！將重試')
-                                        continue
-                                    except ValueError:
-                                        logging.warning(
-                                            f'{retry_down_name}下載異常後重新推送第{tries + 1}(/5)次返回結果錯誤，可能是frp故障！將重試！')
-                                        sleep(5)
-                                        continue
-                                if not repush_flag:
-                                    print_info = f'{retry_down_name}下載異常後重新推送失敗！該檔案直連如下，請手動下載：\n{retry_the_url}'
-                                    notifier.send(print_info)
-                                    logging.error(print_info)
-                                    failed_gid[each_gid] = temp_gid.pop(each_gid)
-                                    continue
+                            file_id_for_this = gid[each_gid][1]
+                            retries_so_far = file_error_retries.get(file_id_for_this, 0)
 
-                                temp_gid[response['result']] = [retry_down_name, gid[each_gid][1], retry_the_url]
-                                temp_gid.pop(each_gid)
-                                logging.warning(
-                                    f'aria2下載{gid[each_gid][0]}出錯！錯誤訊息：{error_message}\t此檔案已重新推送aria2下載！')
-                            else:
-                                print_info = f'aria2下載{gid[each_gid][0]}出錯！錯誤訊息：{error_message}\t該檔案直連如下，' \
-                                             f'請手動下載並反饋bug：\n{gid[each_gid][2]}'
+                            if retries_so_far >= ARIA_ERROR_MAX_RETRIES:
+                                print_info = (
+                                    f'aria2下載{gid[each_gid][0]}重試 {ARIA_ERROR_MAX_RETRIES} 次仍失敗！'
+                                    f'\n錯誤訊息：{error_message}'
+                                    f'\n該檔案直連如下，請手動下載並反饋bug：\n{gid[each_gid][2]}'
+                                )
                                 notifier.send(print_info)
                                 logging.warning(print_info)
                                 failed_gid[each_gid] = temp_gid.pop(each_gid)
+                                continue
+
+                            # Refresh the download URL (PikPak URLs are short-lived and
+                            # may be pointing to a flaky CDN node) and re-push to aria2.
+                            # Same dir + out means aria2 picks up the .aria2 control file
+                            # and resumes from where it left off.
+                            retry_down_name, retry_the_url = get_download_url(file_id_for_this, each_account)
+                            if not retry_the_url:
+                                print_info = f'aria2下載{gid[each_gid][0]}出錯後無法取得新下載連結！錯誤：{error_message}'
+                                notifier.send(print_info)
+                                logging.error(print_info)
+                                failed_gid[each_gid] = temp_gid.pop(each_gid)
+                                continue
+
+                            repush_flag = False
+                            new_response = None
+                            for tries in range(5):
+                                try:
+                                    new_response = aria2_client.add_uri(
+                                        retry_the_url, response["result"]["dir"],
+                                        retry_down_name, download_headers,
+                                    )
+                                    repush_flag = True
+                                    break
+                                except requests.exceptions.ReadTimeout:
+                                    logging.warning(
+                                        f'{retry_down_name}重新推送第{tries + 1}/5次網路超時，將重試')
+                                    continue
+                                except ValueError:
+                                    logging.warning(
+                                        f'{retry_down_name}重新推送第{tries + 1}/5次返回錯誤（可能 frp 故障），將重試')
+                                    sleep(5)
+                                    continue
+                            if not repush_flag:
+                                print_info = f'{retry_down_name}重新推送失敗！直連：\n{retry_the_url}'
+                                notifier.send(print_info)
+                                logging.error(print_info)
+                                failed_gid[each_gid] = temp_gid.pop(each_gid)
+                                continue
+
+                            new_gid = new_response['result']
+                            file_error_retries[file_id_for_this] = retries_so_far + 1
+                            temp_gid[new_gid] = [retry_down_name, file_id_for_this, retry_the_url]
+                            temp_gid.pop(each_gid)
+                            # Carry byte-tracking entry over so progress doesn't reset to 0.
+                            if each_gid in gid_bytes:
+                                gid_bytes[new_gid] = gid_bytes.pop(each_gid)
+                            logging.warning(
+                                f'aria2下載 {gid[each_gid][0]} 出錯（{error_message}），'
+                                f'已重新推送 ({retries_so_far + 1}/{ARIA_ERROR_MAX_RETRIES})'
+                            )
 
                     except KeyError:
                         notifier.send(f'aria2下載{gid[each_gid][0]}任務被刪除！')
