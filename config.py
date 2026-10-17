@@ -39,9 +39,11 @@ def record_config():
 
     # Keep the functions and comments in this file; update only literal settings.
     import ast
+    import stat
     import tempfile
     config_path = os.path.abspath(__file__)
     with open(config_path, encoding='utf-8') as source:
+        original_stat = os.fstat(source.fileno())
         lines = source.readlines()
     updates = []
     for node in ast.parse(''.join(lines)).body:
@@ -51,13 +53,21 @@ def record_config():
                 updates.append((node.lineno - 1, node.end_lineno, f'{target.id} = {globals()[target.id]!r}\n'))
     for start, end, text in reversed(updates):
         lines[start:end] = [text]
-    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=os.path.dirname(config_path),
-                                     delete=False) as output:
-        output.writelines(lines)
-        temporary = output.name
+    temporary = None
     try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=os.path.dirname(config_path),
+                                         delete=False) as output:
+            temporary = output.name
+            output.writelines(lines)
+            output.flush()
+            if hasattr(os, 'fchown'):
+                current_stat = os.fstat(output.fileno())
+                if (current_stat.st_uid, current_stat.st_gid) != (original_stat.st_uid, original_stat.st_gid):
+                    os.fchown(output.fileno(), original_stat.st_uid, original_stat.st_gid)
+            # chown can clear permission bits, so restore the mode afterwards.
+            os.chmod(temporary, stat.S_IMODE(original_stat.st_mode))
         os.replace(temporary, config_path)
     finally:
-        if os.path.exists(temporary):
+        if temporary is not None and os.path.exists(temporary):
             os.unlink(temporary)
     logging.info('已更新config.py文件')

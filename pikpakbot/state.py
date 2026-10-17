@@ -231,12 +231,12 @@ def claim(task_id, resource):
         row = c.execute('SELECT task_id FROM claims WHERE resource=?', (resource,)).fetchone()
         if row and row[0] != task_id:
             # Failed downloads can still be running in aria2 after an RPC outage.
-            # Transfer their persistent file/path reservations only to a retry child.
+            # Transfer their persistent source/file/path reservations only to a retry child.
             ancestor = task_id
             while ancestor:
                 parent = c.execute('SELECT retry_of FROM tasks WHERE task_id=?', (ancestor,)).fetchone()
                 ancestor = parent[0] if parent else None
-                if ancestor == row[0] and resource.startswith(('path:', 'cloud-file:')):
+                if ancestor == row[0] and resource.startswith(('path:', 'cloud-file:', 'source:')):
                     c.execute('UPDATE claims SET task_id=? WHERE resource=?', (task_id, resource))
                     break
             else:
@@ -250,7 +250,7 @@ def claim(task_id, resource):
 def _release_claims(c, task_id, *, preserve_files, preserve_mutation):
     prefixes = []
     if preserve_files:
-        prefixes.extend(('path:', 'cloud-file:'))
+        prefixes.extend(('path:', 'cloud-file:', 'source:'))
     if preserve_mutation:
         prefixes.extend(('source:', 'cloud-task:'))
     exclusions = ''.join(' AND resource NOT LIKE ?' for _ in prefixes)
@@ -285,7 +285,8 @@ def claim_retry(task_id, *, recover=False):
             if uncertain_mutation(old):
                 raise TaskConflict(UNCERTAIN_MESSAGE)
             if c.execute("SELECT 1 FROM claims WHERE task_id=? AND resource NOT LIKE 'path:%' "
-                         "AND resource NOT LIKE 'cloud-file:%'", (task_id,)).fetchone():
+                         "AND resource NOT LIKE 'cloud-file:%' AND resource NOT LIKE 'source:%'",
+                         (task_id,)).fetchone():
                 raise TaskConflict('上一個任務仍在收尾，請稍後再試')
             if not any(old[k] for k in ('magnet', 'cloud_task_id', 'cloud_file_id')):
                 raise TaskConflict('舊記錄沒有來源 ID；請重新貼上 magnet 或使用 /dl file_id')
