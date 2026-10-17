@@ -29,7 +29,8 @@ batch_results = {}
 
 
 def _retry_buttons(task_id):
-    return [ActionButton('🔄 重試', 'retry', task_id), ActionButton('✖️ 忽略', 'dismiss', task_id)]
+    retry = [] if state.uncertain_mutation(state.get_task(task_id)) else [ActionButton('🔄 重試', 'retry', task_id)]
+    return retry + [ActionButton('✖️ 忽略', 'dismiss', task_id)]
 
 
 def _bind(notifier, task_id):
@@ -84,12 +85,7 @@ def submit_cloud_file(notifier, file_id, account):
 
 
 def retry_task(notifier, task_id, *, recover=False):
-    child = state.claim_retry(task_id)
-    row = state.get_task(child)
-    if recover:
-        state.update_task(child, auto_retries=state.get_task(task_id)['auto_retries'])
-    if row['cloud_task_id'] and not row['cloud_file_id']:
-        state.update_task(child, retry_requested=0 if recover else 1)
+    child = state.claim_retry(task_id, recover=recover)
     return _launch(child, notifier)
 
 
@@ -100,19 +96,23 @@ def check_download_thread_status():
 
 def _offline(task_id, notifier):
     row = state.get_task(task_id)
+    if state.uncertain_mutation(row):
+        raise state.TaskConflict(state.UNCERTAIN_MESSAGE)
     if not row['cloud_task_id']:
         errors = []
         accounts = [row['account']] if row['account'] else list(USER)
         for account in accounts:
             try:
-                state.update_task(task_id, submission_started=1)
+                state.update_task(task_id, submission_started=1, account=account)
                 cloud_id, name = magnet_upload(row['magnet'], account, offline_path=row['offline_path'])
-                state.claim(task_id, f'cloud-task:{account}:{cloud_id}')
                 state.update_task(task_id, account=account, name=name, cloud_task_id=cloud_id)
+                state.claim(task_id, f'cloud-task:{account}:{cloud_id}')
                 break
             except (requests.RequestException, AmbiguousMutation) as exc:
                 raise PikPakError(f'提交結果不確定，請先檢查 PikPak 離線列表，避免重複提交：{exc}') from exc
             except PikPakError as exc:
+                # A definite rejection is safe to retry; an unknown outcome is not.
+                state.update_task(task_id, submission_started=0, account=row['account'])
                 errors.append(str(exc))
         else:
             raise PikPakError('提交離線任務失敗：' + ('; '.join(errors) or '沒有設定帳號'))
@@ -162,14 +162,15 @@ def _offline(task_id, notifier):
         if manual or (stalled and phase in ('PHASE_TYPE_RUNNING', 'PHASE_TYPE_PENDING')):
             if not manual and row['auto_retries'] >= getattr(config, 'MAX_AUTO_RETRIES', 3):
                 raise PikPakError('離線任務持續停滯，自動重試次數已用盡')
-            state.update_task(task_id, retry_requested=0, last_retry_at=time(),
+            state.update_task(task_id, retry_requested=0, retry_inflight=1, last_retry_at=time(),
                               auto_retries=row['auto_retries'] + (0 if manual else 1))
             ok, result = retry_offline_task(row['cloud_task_id'], row['account'])
             if not ok:
+                state.update_task(task_id, retry_inflight=0)
                 raise PikPakError(f'PikPak 重試失敗：{result}')
             new_id = (result.get('task') or {}).get('id') or row['cloud_task_id']
+            state.update_task(task_id, cloud_task_id=new_id, retry_inflight=0)
             state.claim(task_id, f'cloud-task:{row["account"]}:{new_id}')
-            state.update_task(task_id, cloud_task_id=new_id)
             best_progress, changed_at = -1, monotonic()
             notifier.progress(task_id, f'🔄 已重試離線任務\n{row["name"]}')
             sleep(10)
@@ -199,8 +200,17 @@ def _safe_destination(directory, name):
 
 def _saved_complete(item):
     path = Path(item['directory']) / item['name']
-    return (item['status'] == 'complete' and path.is_file()
+    return (item.get('destination_owned') and item['status'] == 'complete' and path.is_file()
             and path.stat().st_size == item['size'] and not Path(str(path) + '.aria2').exists())
+
+
+def _check_destination(item, *, submitting=False):
+    _, path = _safe_destination(item['directory'], item['name'])
+    control = Path(str(path) + '.aria2')
+    if not item.get('destination_owned') and (item.get('gid') or path.exists() or control.exists()):
+        raise state.TaskConflict(f'下載路徑已有資料或未驗證的 GID，無法確認來源：{path.name}；已保留雲端檔案')
+    if submitting and path.exists() and not control.exists():
+        raise state.TaskConflict(f'既有檔案缺少 aria2 控制檔，禁止猜測續傳：{path.name}；已保留雲端檔案')
 
 
 def _update_file(task_id, item, **fields):
@@ -212,8 +222,9 @@ def _push(task_id, item, account):
     _, url = get_download_url(item['file_id'], account)
     if not url:
         raise PikPakError('檔案沒有下載連結')
+    _check_destination(item, submitting=True)
     gid = item.get('gid') or uuid.uuid4().hex[:16]
-    _update_file(task_id, item, gid=gid, status='active', error=None)
+    _update_file(task_id, item, gid=gid, status='active', error=None, destination_owned=1)
     for attempt in range(3):
         try:
             response = aria2_client.add_uri(url, item['directory'], item['name'],
@@ -254,6 +265,7 @@ def _run_aria2_phase(notifier, file_id, account, task_id):
         _, path = _safe_destination(item['directory'], item['name'])
         state.claim(task_id, 'path:' + os.path.normcase(str(path)))
         state.claim(task_id, f'cloud-file:{account}:{item["file_id"]}')
+        _check_destination(item)
     state.update_task(task_id, stage=state.STAGE_DOWNLOAD, progress=0)
     pending = []
     for item in items:
@@ -338,6 +350,8 @@ def _run_aria2_phase(notifier, file_id, account, task_id):
     if failed:
         raise aria2_client.Aria2Error('部分檔案下載失敗；全部雲端內容已保留：' +
                                    '; '.join(f'{item["name"]}: {item["error"]}' for item in failed))
+    if not all(_saved_complete(item) for item in items):
+        raise aria2_client.Aria2Error('清理前檔案驗證失敗；已保留全部雲端內容')
     state.update_task(task_id, stage=state.STAGE_CLEANUP, progress=100)
     note = '已保留雲端檔案（自動清理關閉）'
     if auto_delete_judge(account) == 'on':
@@ -356,6 +370,8 @@ def _run_aria2_phase(notifier, file_id, account, task_id):
 def _run_task(task_id, notifier, batch_id=None):
     try:
         row = state.get_task(task_id)
+        if state.uncertain_mutation(row):
+            raise state.TaskConflict(state.UNCERTAIN_MESSAGE)
         notifier.progress(task_id, f'📥 處理任務 `{task_id}`')
         if row['cloud_file_id']:
             file_id, account = row['cloud_file_id'], row['account']
@@ -368,7 +384,8 @@ def _run_task(task_id, notifier, batch_id=None):
         logging.exception('Task %s failed', task_id)
         state.update_task(task_id, stage=state.STAGE_FAILED, error=str(exc)[:2000])
         notifier.progress(task_id, f'❌ 下載失敗\n{str(exc)[:1500]}')
-        notifier.send(f'任務 `{task_id}` 可重試接續；已保留下載資料。', buttons=_retry_buttons(task_id))
+        message = state.UNCERTAIN_MESSAGE if state.uncertain_mutation(state.get_task(task_id)) else '可重試接續；已保留下載資料。'
+        notifier.send(f'任務 `{task_id}` {message}', buttons=_retry_buttons(task_id))
     finally:
         state.mark_failed_if_not_terminal(task_id, 'worker ended without terminal state')
         row = state.get_task(task_id)
@@ -420,6 +437,10 @@ def retry_offline_candidates(account, min_progress, notifier=None, *, automatic=
 def startup_recovery(admin_notifier):
     for row in state.list_recent(limit=10000, stage_filter=state.STAGE_FAILED):
         if row['error'] != 'bot restarted while task was in flight' or row['retry_child']:
+            continue
+        if state.uncertain_mutation(row):
+            state.update_task(row['task_id'], error=state.UNCERTAIN_MESSAGE)
+            admin_notifier.send(f'任務 `{row["task_id"]}` {state.UNCERTAIN_MESSAGE}')
             continue
         if not (row['cloud_task_id'] or row['cloud_file_id'] or
                 (row['magnet'] and row['interrupted_stage'] == state.STAGE_QUEUED and not row['submission_started'])):

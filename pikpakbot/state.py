@@ -39,11 +39,20 @@ _EXTRA_COLUMNS = {
     'manifest_ready': 'INTEGER DEFAULT 0',
     'submission_started': 'INTEGER DEFAULT 0', 'interrupted_stage': 'TEXT',
     'last_retry_at': 'REAL',
+    'retry_inflight': 'INTEGER DEFAULT 0',
 }
 
 
 class TaskConflict(ValueError):
     pass
+
+
+UNCERTAIN_MESSAGE = 'PikPak 提交或重試結果尚未確認；請先檢查原任務，確認 file_id 後用 /dl 接續，禁止重新提交'
+
+
+def uncertain_mutation(row):
+    return bool(row and (row.get('retry_inflight') or
+                (row.get('submission_started') and not row.get('cloud_task_id') and not row.get('cloud_file_id'))))
 
 
 def _init_conn():
@@ -79,6 +88,9 @@ def _init_conn():
         directory TEXT NOT NULL, gid TEXT, status TEXT NOT NULL DEFAULT 'pending',
         size INTEGER NOT NULL DEFAULT 0, error TEXT,
         PRIMARY KEY(task_id, file_id))''')
+    file_columns = {r[1] for r in conn.execute('PRAGMA table_info(task_files)')}
+    if 'destination_owned' not in file_columns:
+        conn.execute('ALTER TABLE task_files ADD COLUMN destination_owned INTEGER NOT NULL DEFAULT 0')
     conn.execute('''CREATE TABLE IF NOT EXISTS observations (
         account TEXT NOT NULL, cloud_task_id TEXT NOT NULL,
         progress INTEGER NOT NULL, phase TEXT, changed_at REAL NOT NULL,
@@ -202,8 +214,12 @@ def sweep_interrupted():
         )
     with _lock:
         c = _conn_ref()
-        c.execute("DELETE FROM claims WHERE resource NOT LIKE 'path:%' AND resource NOT LIKE 'cloud-file:%'")
-        c.execute("DELETE FROM claims WHERE task_id IN (SELECT task_id FROM tasks WHERE stage='complete')")
+        for claim_row in c.execute('SELECT DISTINCT task_id FROM claims').fetchall():
+            row = c.execute('SELECT * FROM tasks WHERE task_id=?', (claim_row[0],)).fetchone()
+            row = dict(row) if row else None
+            _release_claims(c, claim_row[0],
+                            preserve_files=bool(row and row['stage'] != STAGE_COMPLETE),
+                            preserve_mutation=uncertain_mutation(row))
         c.commit()
     return len(actives)
 
@@ -231,21 +247,30 @@ def claim(task_id, resource):
         c.commit()
 
 
+def _release_claims(c, task_id, *, preserve_files, preserve_mutation):
+    prefixes = []
+    if preserve_files:
+        prefixes.extend(('path:', 'cloud-file:'))
+    if preserve_mutation:
+        prefixes.extend(('source:', 'cloud-task:'))
+    exclusions = ''.join(' AND resource NOT LIKE ?' for _ in prefixes)
+    c.execute('DELETE FROM claims WHERE task_id=?' + exclusions,
+              [task_id, *(prefix + '%' for prefix in prefixes)])
+
+
 def release(task_id, *, preserve_files=False):
     with _lock:
         c = _conn_ref()
         uncertain = preserve_files and c.execute(
             "SELECT 1 FROM task_files WHERE task_id=? AND gid IS NOT NULL AND status!='complete'",
             (task_id,)).fetchone()
-        if uncertain:
-            c.execute("DELETE FROM claims WHERE task_id=? AND resource NOT LIKE 'path:%' "
-                      "AND resource NOT LIKE 'cloud-file:%'", (task_id,))
-        else:
-            c.execute('DELETE FROM claims WHERE task_id=?', (task_id,))
+        row = c.execute('SELECT * FROM tasks WHERE task_id=?', (task_id,)).fetchone()
+        _release_claims(c, task_id, preserve_files=bool(uncertain),
+                        preserve_mutation=uncertain_mutation(dict(row) if row else None))
         c.commit()
 
 
-def claim_retry(task_id):
+def claim_retry(task_id, *, recover=False):
     """Atomically create a single child attempt; stale buttons stay consumed."""
     with _lock:
         c = _conn_ref()
@@ -257,6 +282,8 @@ def claim_retry(task_id):
             old = dict(old)
             if old['stage'] not in (STAGE_FAILED, STAGE_CANCELED) or old['retry_child']:
                 raise TaskConflict('任務仍在執行、已完成，或已經重試；請使用最新任務的按鈕')
+            if uncertain_mutation(old):
+                raise TaskConflict(UNCERTAIN_MESSAGE)
             if c.execute("SELECT 1 FROM claims WHERE task_id=? AND resource NOT LIKE 'path:%' "
                          "AND resource NOT LIKE 'cloud-file:%'", (task_id,)).fetchone():
                 raise TaskConflict('上一個任務仍在收尾，請稍後再試')
@@ -266,7 +293,11 @@ def claim_retry(task_id):
             now = time.time()
             fields = {k: old[k] for k in ('magnet', 'name', 'account', 'source_kind',
                       'offline_path', 'cloud_task_id', 'cloud_file_id', 'manifest_ready',
-                      'discord_channel_id', 'discord_message_id')}
+                      'discord_channel_id', 'discord_message_id', 'submission_started',
+                      'retry_requested', 'retry_inflight', 'last_retry_at')}
+            if not recover and old['cloud_task_id'] and not old['cloud_file_id']:
+                fields['retry_requested'] = 1
+            fields['auto_retries'] = old['auto_retries'] if recover else 0
             fields.update(task_id=child, stage=STAGE_QUEUED, retry_of=task_id,
                           created_at=now, updated_at=now)
             cols = ','.join(fields)
@@ -274,7 +305,7 @@ def claim_retry(task_id):
                       list(fields.values()))
             c.execute('UPDATE tasks SET retry_child=? WHERE task_id=?', (child, task_id))
             c.execute('''INSERT INTO task_files
-                SELECT ?, file_id, name, directory, gid, status, size, error
+                SELECT ?, file_id, name, directory, gid, status, size, error, destination_owned
                 FROM task_files WHERE task_id=?''', (child, task_id))
     return child
 
@@ -293,7 +324,7 @@ def request_offline_retry(task_id):
     with _lock:
         c = _conn_ref()
         result = c.execute('''UPDATE tasks SET retry_requested=1 WHERE task_id=? AND stage=?
-                              AND retry_requested=0 AND COALESCE(last_retry_at,0)<=?''',
+                              AND retry_requested=0 AND retry_inflight=0 AND COALESCE(last_retry_at,0)<=?''',
                            (task_id, STAGE_OFFLINE, time.time() - 60))
         c.commit()
         return result.rowcount == 1
@@ -305,7 +336,7 @@ def save_file(task_id, file_id, name, directory, **fields):
         c.execute('''INSERT OR IGNORE INTO task_files(task_id,file_id,name,directory)
                      VALUES (?,?,?,?)''', (task_id, file_id, name, directory))
         if fields:
-            if not set(fields) <= {'gid', 'status', 'size', 'error'}:
+            if not set(fields) <= {'gid', 'status', 'size', 'error', 'destination_owned'}:
                 raise ValueError('Unknown file field')
             c.execute(f'UPDATE task_files SET {",".join(k + "=?" for k in fields)} '
                       'WHERE task_id=? AND file_id=?', [*fields.values(), task_id, file_id])

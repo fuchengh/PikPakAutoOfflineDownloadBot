@@ -18,6 +18,10 @@ jobs:
           cache: pip
           cache-dependency-path: requirements*.txt
       - run: python -m pip install -r requirements-test.txt
+      - name: Install aria2 for isolated localhost regression tests
+        run: sudo apt-get update && sudo apt-get install -y aria2
       - run: python -m pytest -q
+        env:
+          REQUIRE_ARIA2_TESTS: '1'
       - run: ruff check . --select F,E9
       - run: python -m compileall -q main.py config.py pikpakbot

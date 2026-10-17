@@ -133,7 +133,7 @@ def test_aria_submission_uses_idempotent_gid_and_resume_options(monkeypatch):
     monkeypatch.setattr(aria, '_rpc', rpc)
     aria.add_uri('url', '/downloads', 'file', {'User-Agent': 'test'}, gid='gid')
     options = rpc.call_args.args[1][1]
-    assert options['gid'] == 'gid' and options['continue'] == 'true'
+    assert options['gid'] == 'gid' and options['continue'] == 'false'
     assert options['auto-file-renaming'] == options['allow-overwrite'] == 'false'
     assert options['header'] == ['User-Agent: test']
 

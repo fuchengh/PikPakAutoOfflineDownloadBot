@@ -123,7 +123,7 @@ def test_existing_gid_is_adopted_after_restart(monkeypatch):
     tid = task()
     directory = str(Path(p.ARIA2_DOWNLOAD_PATH))
     state.set_manifest(tid, 'one.bin', 'one', [('one', 'one.bin', directory)])
-    state.save_file(tid, 'one', 'one.bin', directory, gid='old-gid')
+    state.save_file(tid, 'one', 'one.bin', directory, gid='old-gid', destination_owned=1)
     (Path(directory) / 'one.bin').write_bytes(b'0123456789')
     downloads['old-gid'] = {'status': 'complete', 'totalLength': '10', 'completedLength': '10'}
     p._run_task(tid, NullNotifier())

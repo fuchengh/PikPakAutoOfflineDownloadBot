@@ -406,7 +406,9 @@ def retry_offline_task(task_id, account):
 
     try:
         _resp, result = _pikpak_request('POST', retry_url, account, json=retry_data)
-    except Exception as e:
+    except (requests.RequestException, AmbiguousMutation) as exc:
+        raise AmbiguousMutation(f'PikPak RETRY 結果尚未確認：{exc}') from exc
+    except PikPakError as e:
         logging.error(f"帳號{account}重試任務時發生錯誤: {e}")
         return False, str(e)
 

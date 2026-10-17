@@ -28,7 +28,9 @@ def _rpc(method, params, timeout=10, *, authenticated=True):
 def add_uri(url, dir_, name, headers, timeout=10, *, gid=None):
     options = {'dir': dir_, 'out': name,
                'header': [f'{key}: {value}' for key, value in headers.items()],
-               'continue': 'true', 'auto-file-renaming': 'false', 'allow-overwrite': 'false'}
+               # Owned .aria2 control files resume without --continue. Never infer
+               # progress from the length of an unrelated existing file.
+               'continue': 'false', 'auto-file-renaming': 'false', 'allow-overwrite': 'false'}
     if gid:
         options['gid'] = gid
     return _rpc('aria2.addUri', [[url], options], timeout=timeout)

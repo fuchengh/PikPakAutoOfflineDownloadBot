@@ -16,7 +16,7 @@ def test_rpc_outage_reserves_paths_across_restart_and_transfers_to_retry(monkeyp
     tid = state.create_task(cloud_file_id='file', account='a')
     directory = p.ARIA2_DOWNLOAD_PATH
     state.set_manifest(tid, 'file.bin', 'file', [('file', 'file.bin', directory)])
-    state.save_file(tid, 'file', 'file.bin', directory, gid='known-gid', status='active')
+    state.save_file(tid, 'file', 'file.bin', directory, gid='known-gid', status='active', destination_owned=1)
     monkeypatch.setattr(p.aria2_client, 'tell_status_many', Mock(side_effect=requests.Timeout('rpc down')))
     p._run_task(tid, NullNotifier())
     path_key = 'path:' + __import__('os').path.normcase(str(Path(directory) / 'file.bin'))
@@ -129,7 +129,7 @@ def test_byte_progress_is_reported_for_single_large_file(monkeypatch):
     directory = p.ARIA2_DOWNLOAD_PATH
     tid = state.create_task(cloud_file_id='file', account='a')
     state.set_manifest(tid, 'file.bin', 'file', [('file', 'file.bin', directory)])
-    state.save_file(tid, 'file', 'file.bin', directory, gid='gid')
+    state.save_file(tid, 'file', 'file.bin', directory, gid='gid', destination_owned=1)
     calls = [0]
     def statuses(gids):
         calls[0] += 1
