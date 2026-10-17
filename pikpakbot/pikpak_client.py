@@ -1,8 +1,12 @@
 import asyncio
 import logging
-import re
 import threading
-from time import sleep
+from time import sleep, monotonic
+from random import uniform
+
+from pikpakbot.http import session
+from pikpakbot import state
+import config
 
 import requests
 from pikpakapi import PikPakApi
@@ -15,89 +19,90 @@ PIKPAK_USER_URL = "https://user.mypikpak.com"
 DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_ATTEMPTS = 3
 
-pikpak_headers = [None] * len(USER)
-pikpak_clients = [None] * len(USER)
-login_lock = threading.Lock()
+pikpak_headers = {}
+pikpak_clients = {}
+login_lock = threading.RLock()
+_snapshot_lock = threading.Lock()
+_snapshot_locks = {}
+_snapshots = {}
+
+
+def forget_account(account):
+    with login_lock:
+        pikpak_headers.pop(account, None)
+        pikpak_clients.pop(account, None)
+    invalidate_offline(account)
+
+
+def invalidate_offline(account):
+    with _snapshot_lock:
+        _snapshots.pop(account, None)
+
 
 
 class PikPakError(Exception):
     """Raised when a PikPak API call fails after exhausting retries."""
 
 
+class AmbiguousMutation(PikPakError):
+    """The provider may have accepted a write; don't submit it again elsewhere."""
+
+
 def _pikpak_request(method, url, account, *, max_attempts=DEFAULT_MAX_ATTEMPTS,
                     timeout=DEFAULT_TIMEOUT, **kwargs):
+    """Strict responses; retry transient reads with jitter, never return partial data.
+
+    A timed-out mutation may have succeeded: don't blindly duplicate POSTs.
+    Authentication refresh has its own one-shot budget.
     """
-    Make a PikPak HTTP request with automatic recovery.
-
-    Handles:
-      - Session expiry (error_code 16 or HTTP 401) -> re-login, retry (does not consume an attempt; one re-login per call).
-      - Transient network errors (ReadTimeout / ConnectionError) -> exponential backoff.
-      - Rate limit (HTTP 429 / body contains "too_frequent") -> longer backoff.
-
-    Returns (response, parsed_json_or_empty_dict).
-    Raises the last network exception (or PikPakError) if all attempts fail.
-
-    Caller still inspects the returned dict for application-level errors that
-    aren't auto-recoverable (e.g. error_description for unknown magnet).
-    """
-    last_exc = None
     relogin_used = False
-
-    for attempt in range(max_attempts):
+    attempt = 0
+    while attempt < max_attempts:
         try:
-            login_headers = get_headers(account)
-            resp = requests.request(method, url, headers=login_headers, timeout=timeout, **kwargs)
-
-            try:
-                data = resp.json() if resp.content else {}
-            except ValueError:
-                data = {}
-
-            session_expired = (
-                resp.status_code == 401
-                or (isinstance(data, dict) and data.get('error_code') == 16)
-            )
-            if session_expired and not relogin_used:
-                logging.info(f"帳號{account}登入過期，正在重新登入")
-                login(account)
-                relogin_used = True
+            resp = session().request(method, url, headers=get_headers(account),
+                                     timeout=timeout, **kwargs)
+        except (requests.Timeout, requests.ConnectionError):
+            attempt += 1
+            if method.upper() not in ('GET', 'DELETE') or attempt >= max_attempts:
+                raise
+            sleep(2 ** (attempt - 1) + uniform(0, 1))
+            continue
+        try:
+            data = resp.json() if resp.content else {}
+        except ValueError as exc:
+            error_type = AmbiguousMutation if method.upper() == 'POST' else PikPakError
+            raise error_type(f'PikPak HTTP {resp.status_code}: invalid JSON') from exc
+        if not isinstance(data, dict):
+            error_type = AmbiguousMutation if method.upper() == 'POST' else PikPakError
+            raise error_type('PikPak 回應不是 JSON object')
+        if (resp.status_code == 401 or str(data.get('error_code')) == '16') and not relogin_used:
+            login(account)
+            relogin_used = True
+            continue
+        description = str(data.get('error_description') or data.get('error') or '')
+        transient = resp.status_code == 429 or (resp.status_code >= 500 and method.upper() == 'GET')
+        if transient:
+            attempt += 1
+            if attempt < max_attempts:
+                try:
+                    wait = min(60, max(0, float(resp.headers.get('Retry-After', 0))))
+                except (ValueError, TypeError):
+                    wait = 0
+                sleep(max(wait, 2 ** attempt) + uniform(0, 1))
                 continue
-
-            body_text = resp.text if resp.status_code >= 400 else ''
-            rate_limited = (
-                resp.status_code == 429
-                or 'too_frequent' in body_text.lower()
-                or 'too frequent' in body_text.lower()
-            )
-            if rate_limited:
-                wait = 5 * (2 ** attempt)
-                logging.warning(
-                    f"帳號{account}被 PikPak 限流 (HTTP {resp.status_code})，{wait}s 後重試 ({attempt + 1}/{max_attempts})"
-                )
-                sleep(wait)
-                continue
-
-            return resp, data
-
-        except (requests.exceptions.ReadTimeout,
-                requests.exceptions.ConnectTimeout,
-                requests.exceptions.ConnectionError) as e:
-            last_exc = e
-            wait = 2 ** attempt
-            logging.warning(
-                f"帳號{account} {method} 請求失敗 ({attempt + 1}/{max_attempts}): {e}，{wait}s 後重試"
-            )
-            sleep(wait)
-
-    if last_exc:
-        raise last_exc
-    raise PikPakError(f"帳號{account} {method} {url} 重試 {max_attempts} 次後仍失敗")
+        if resp.status_code >= 400 or data.get('error') or data.get('error_code') not in (None, 0, '0'):
+            error_type = AmbiguousMutation if method.upper() == 'POST' and resp.status_code >= 500 else PikPakError
+            raise error_type(f'PikPak HTTP {resp.status_code}, code={data.get("error_code")}: {description}')
+        if method.upper() != 'GET':
+            invalidate_offline(account)
+        return resp, data
+    raise PikPakError('PikPak 暫時錯誤重試次數已用盡')
 
 
 def registerFuc():
     try:
         url = 'https://pikpak.kinh.cc/GetFreeAccount.php'
-        resp = requests.get(url)
+        resp = session().get(url, timeout=DEFAULT_TIMEOUT)
         account = resp.json()['Data'].split('|')[0].split(':')[1].strip()
         password = resp.json()['Data'].split('|')[1].split(':')[1].strip()
         if account and password:
@@ -141,159 +146,127 @@ def login(account):
         finally:
             loop.close()
         headers = client.get_headers()
-        pikpak_headers[index] = headers.copy()
-        pikpak_clients[index] = client
+        pikpak_headers[account] = headers.copy()
+        pikpak_clients[account] = client
 
         logging.info(f"帳號{account}登入成功！")
 
 
 def get_headers(account):
-    index = USER.index(account)
-    if not pikpak_headers[index]:
-        login(account)
-    return pikpak_headers[index]
+    with login_lock:
+        if account not in USER:
+            raise PikPakError('帳號已移除')
+        if account not in pikpak_headers:
+            login(account)
+        return pikpak_headers[account].copy()
 
 
 def get_clients(account):
-    index = USER.index(account)
-    if not pikpak_clients[index]:
-        login(account)
-    return pikpak_clients[index]
+    with login_lock:
+        if account not in USER:
+            raise PikPakError('帳號已移除')
+        if account not in pikpak_clients:
+            login(account)
+        return pikpak_clients[account]
 
 
 def magnet_upload(file_url, account, parent_id=None, offline_path=None):
-    client = get_clients(account)
-    torrent_url = f"{PIKPAK_API_URL}/drive/v1/files"
     if offline_path:
-        parent_ids = asyncio.run(client.path_to_id(path=offline_path, create=True))
-        if parent_ids and offline_path.split("/")[-1] == parent_ids[-1]["name"]:
-            parent_id = parent_ids[-1]["id"]
-
-    torrent_data = {
-        "kind": "drive#file",
-        "name": "",
-        "upload_type": "UPLOAD_TYPE_URL",
-        "url": {"url": file_url},
-        "folder_type": "DOWNLOAD" if not parent_id else "",
-        "parent_id": parent_id,
-    }
-
-    try:
-        _resp, torrent_result = _pikpak_request('POST', torrent_url, account, json=torrent_data)
-    except Exception as e:
-        logging.error(f"帳號{account}提交離線下載任務失敗: {e}")
-        return None, None
-
-    if "error" in torrent_result:
-        logging.error(f"帳號{account}提交離線下載任務失敗，錯誤訊息：{torrent_result.get('error_description')}")
-        return None, None
-
-    file_url_part = re.search(r'^(magnet:\?).*(xt=.+?)(&|$)', file_url)
-    if file_url_part:
-        file_url_simple = ''.join(file_url_part.groups()[:-1])
-        logging.info(f"帳號{account}添加離線任務:{file_url_simple}")
-    else:
-        logging.info(f"帳號{account}添加離線任務:{file_url}")
-
-    return torrent_result['task']['id'], torrent_result['task']['name']
+        if not offline_path.startswith('/') or '..' in offline_path.split('/'):
+            raise ValueError('離線路徑必須是絕對路徑且不能包含 ..')
+        for part in filter(None, offline_path.split('/')):
+            folders = get_list(parent_id or '', account)
+            match = next((f for f in folders if f['name'] == part and f['kind'] == 'drive#folder'), None)
+            if match:
+                parent_id = match['id']
+            else:
+                _, folder = _pikpak_request('POST', f'{PIKPAK_API_URL}/drive/v1/files', account,
+                    json={'kind': 'drive#folder', 'name': part, 'parent_id': parent_id or ''})
+                parent_id = folder['id']
+    _, result = _pikpak_request('POST', f'{PIKPAK_API_URL}/drive/v1/files', account, json={
+        'kind': 'drive#file', 'name': '', 'upload_type': 'UPLOAD_TYPE_URL',
+        'url': {'url': file_url}, 'folder_type': 'DOWNLOAD' if not parent_id else '',
+        'parent_id': parent_id,
+    })
+    task = result.get('task') or {}
+    if not task.get('id'):
+        raise AmbiguousMutation('提交離線任務的回應缺少 task.id')
+    return task['id'], task.get('name') or file_url[:80]
 
 
-def get_offline_list(account):
-    tasks = []
-    next_page_token = ""
-
+def _pages(endpoint, account, key, params):
+    items, seen = [], set()
+    token = ''
     while True:
-        offline_list_url = (
-            f"{PIKPAK_API_URL}/drive/v1/tasks?type=offline&page_token={next_page_token}"
-            "&thumbnail_size=SIZE_LARGE&filters=%7B%7D&with=reference_resource"
-        )
+        _, data = _pikpak_request('GET', f'{PIKPAK_API_URL}{endpoint}', account,
+                                  params={**params, 'page_token': token})
+        if not isinstance(data.get(key), list):
+            raise PikPakError(f'PikPak 列表回應缺少 {key}')
+        items.extend(data[key])
+        token = data.get('next_page_token') or ''
+        if not token:
+            return items
+        if token in seen:
+            raise PikPakError('PikPak 分頁 token 重複；列表不完整')
+        seen.add(token)
+
+
+def get_offline_list(account, *, fresh=False):
+    """Coalesce per-account reads, including failed snapshots; never use stale data."""
+    with _snapshot_lock:
+        lock = _snapshot_locks.setdefault(account, threading.Lock())
+    with lock:
+        with _snapshot_lock:
+            cached = _snapshots.get(account)
+        if not fresh and cached and monotonic() - cached[0] < 5:
+            if isinstance(cached[1], Exception):
+                raise cached[1]
+            return [dict(t) for t in cached[1]]
         try:
-            _resp, offline_list_info = _pikpak_request('GET', offline_list_url, account)
-        except Exception as e:
-            logging.error(f"帳號{account}獲取離線任務失敗: {e}")
-            return tasks
-
-        if "error" in offline_list_info:
-            logging.error(f"帳號{account}獲取離線任務失敗，錯誤訊息：{offline_list_info.get('error_description')}")
-            return tasks
-
-        tasks.extend(offline_list_info.get('tasks', []))
-
-        next_page_token = offline_list_info.get('next_page_token', '')
-        if not next_page_token:
-            break
-
-    return tasks
+            tasks = _pages('/drive/v1/tasks', account, 'tasks', {
+                'type': 'offline', 'thumbnail_size': 'SIZE_LARGE', 'filters': '{}',
+                'with': 'reference_resource'})
+        except Exception as exc:
+            with _snapshot_lock:
+                _snapshots[account] = (monotonic(), exc)
+            raise
+        state.observe(account, tasks)
+        with _snapshot_lock:
+            _snapshots[account] = (monotonic(), tasks)
+        return [dict(t) for t in tasks]
 
 
 def get_download_url(file_id, account):
-    download_url = f"{PIKPAK_API_URL}/drive/v1/files/{file_id}?_magic=2021&thumbnail_size=SIZE_LARGE"
-
-    try:
-        _resp, download_info = _pikpak_request('GET', download_url, account)
-    except Exception as e:
-        logging.error(f"帳號{account}獲取檔案下載資訊失敗: {e}")
-        return "", ""
-
-    if "error" in download_info:
-        logging.error(f"帳號{account}獲取檔案下載資訊失敗，錯誤訊息：{download_info.get('error_description')}")
-        return "", ""
-
-    return download_info['name'], download_info['web_content_link']
+    _, data = _pikpak_request('GET', f'{PIKPAK_API_URL}/drive/v1/files/{file_id}', account,
+                              params={'_magic': '2021', 'thumbnail_size': 'SIZE_LARGE'})
+    if not data.get('name'):
+        raise PikPakError(f'檔案 {file_id} 缺少名稱')
+    if data.get('kind') == 'drive#folder':
+        return data['name'], ''
+    if not data.get('web_content_link'):
+        raise PikPakError(f'檔案 {file_id} 尚無可用下載連結')
+    return data['name'], data['web_content_link']
 
 
 def get_list(folder_id, account):
-    file_list = []
-    list_url = (
-        f"{PIKPAK_API_URL}/drive/v1/files?parent_id={folder_id}&thumbnail_size=SIZE_LARGE"
-        "&filters=%7B%22trashed%22:%7B%22eq%22:false%7D%7D"
-    )
-
-    try:
-        _resp, list_result = _pikpak_request('GET', list_url, account)
-    except Exception as e:
-        logging.error(f"帳號{account}獲取資料夾下檔案id失敗: {e}")
-        return file_list
-
-    if "error" in list_result:
-        logging.error(f"帳號{account}獲取資料夾下檔案id失敗，錯誤訊息：{list_result.get('error_description')}")
-        return file_list
-
-    file_list += list_result['files']
-
-    while list_result.get('next_page_token'):
-        list_url = (
-            f"{PIKPAK_API_URL}/drive/v1/files?parent_id={folder_id}&page_token={list_result['next_page_token']}"
-            "&thumbnail_size=SIZE_LARGE&filters=%7B%22trashed%22:%7B%22eq%22:false%7D%7D"
-        )
-        try:
-            _resp, list_result = _pikpak_request('GET', list_url, account)
-        except Exception as e:
-            logging.error(f"帳號{account}獲取資料夾下檔案id分頁失敗: {e}")
-            return file_list
-
-        if "error" in list_result:
-            logging.error(f"帳號{account}獲取資料夾下檔案id分頁失敗，錯誤訊息：{list_result.get('error_description')}")
-            return file_list
-
-        file_list += list_result.get('files', [])
-
-    return file_list
+    return _pages('/drive/v1/files', account, 'files', {
+        'parent_id': folder_id, 'thumbnail_size': 'SIZE_LARGE',
+        'filters': '{"trashed":{"eq":false}}'})
 
 
 def get_folder_all_file(folder_id, path, account):
-    folder_list = get_list(folder_id, account)
-    for a in folder_list:
-        if a["kind"] == "drive#file":
-            down_name, down_url = get_download_url(a["id"], account)
-            if down_name == "":
-                continue
-            yield down_name, down_url, a['id'], path
-        elif a['name'] == 'My Pack' and folder_id == '':
-            yield from get_folder_all_file(a["id"], path, account)
+    for item in get_list(folder_id, account):
+        if item['kind'] == 'drive#file':
+            name, url = get_download_url(item['id'], account)
+            if not url:
+                raise PikPakError(f'檔案 {item["id"]} 缺少下載連結')
+            yield name, url, item['id'], path
         else:
-            new_path = path + a['name'] + "/"
-            yield from get_folder_all_file(a["id"], new_path, account)
+            # Validate every remote directory component before constructing paths.
+            name = item['name']
+            if name in ('.', '..') or any(c in name for c in '/\\'):
+                raise PikPakError('雲端資料夾名稱包含路徑分隔符')
+            yield from get_folder_all_file(item['id'], path + name + '/', account)
 
 
 def get_folder_all(account):
@@ -401,30 +374,6 @@ def delete_offline_tasks(account, task_ids=None, delete_files_too=False, phase_f
     return success_count, fail_count
 
 
-def cancel_offline_tasks_by_name(account, name, delete_cloud_files=True):
-    """Cancel/delete all offline tasks on PikPak whose name matches `name`.
-
-    Used by the retry button: before re-submitting a failed magnet, kill any
-    leftover offline tasks (still downloading, errored, or completed-with-orphan-
-    cloud-folder) so PikPak doesn't end up showing two duplicates and the cloud
-    doesn't accumulate orphan folders.
-
-    Returns (matched_count, success_count, fail_count). matched_count==0 means
-    nothing to clean — not an error.
-    """
-    if not name or not account:
-        return 0, 0, 0
-    tasks = get_offline_list(account)
-    matches = [t['id'] for t in tasks if t.get('name') == name and t.get('id')]
-    if not matches:
-        return 0, 0, 0
-    logging.info(f"帳號{account} retry 前清理：找到 {len(matches)} 個同名舊離線任務 ({name!r})")
-    success, fail = delete_offline_tasks(
-        account, task_ids=matches, delete_files_too=delete_cloud_files
-    )
-    return len(matches), success, fail
-
-
 def empty_trash(account):
     """清空回收站中的所有檔案"""
     empty_url = f"{PIKPAK_API_URL}/drive/v1/files/trash:empty"
@@ -499,135 +448,34 @@ def delete_offline_task(task_ids, account, delete_files=False):
     return False, resp.text
 
 
-def get_stuck_tasks(account, min_progress=90):
-    """
-    獲取卡住的離線任務
-    min_progress: 最小進度閾值，預設 90%
-    返回: [{id, name, progress, file_id}, ...]
-    """
+def get_stuck_tasks(account, min_progress=90, *, include_errors=True):
     tasks = get_offline_list(account)
-    stuck = []
-
-    logging.debug(f"帳號{account}共有 {len(tasks)} 個離線任務，篩選進度 >= {min_progress}%")
-
+    ages = state.observe(account, tasks)
+    threshold = getattr(config, 'OFFLINE_STALL_SECONDS', 1200)
+    result = []
     for task in tasks:
-        phase = task.get('phase', '')
-        progress = int(task.get('progress', 0))
-        message = task.get('message', '')
-        name = task.get('name') or task.get('file_name') or 'Unknown'
-
-        logging.debug(f"  任務: {name}, phase={phase}, progress={progress}%")
-
-        if phase == 'PHASE_TYPE_COMPLETE' and progress == 100:
+        phase = task.get('phase')
+        progress = int(task.get('progress') or 0)
+        message = str(task.get('message') or '').lower()
+        if 'file deleted' in message or 'file_deleted' in message:
             continue
-
-        if "file deleted" in message.lower() or "file_deleted" in message.lower():
-            continue
-
-        if phase == 'PHASE_TYPE_ERROR':
-            continue
-
-        if progress >= min_progress and progress < 100:
-            stuck.append({
-                'id': task.get('id'),
-                'name': name,
-                'progress': progress,
-                'file_id': task.get('file_id'),
-                'phase': phase,
-            })
-            logging.debug(f"    ↳ 判定為卡住的任務")
-
-    return stuck
+        failed = phase == 'PHASE_TYPE_ERROR'
+        stalled = (phase in ('PHASE_TYPE_RUNNING', 'PHASE_TYPE_PENDING')
+                   and progress >= min_progress and ages.get(task.get('id'), 0) >= threshold)
+        if (include_errors and failed) or stalled:
+            result.append({**task, 'name': task.get('name') or task.get('file_name') or 'Unknown',
+                           'progress': progress})
+    return result
 
 
-def retry_stuck_tasks(account, min_progress=90, delete_cloud_files=True, notifier=None):
-    """
-    找出並重試卡住的任務
-    1. 找出進度 >= min_progress 但未完成的任務
-    2. 刪除這些任務的雲端檔案 (可選)
-    3. 使用 PikPak 的 RETRY 功能重新開始
-
-    notifier 會傳給 spawn 出來的 process_magnet 線程，讓後續通知去對的地方。
-
-    返回: (success_count, fail_count, results)
-    """
-    # 延遲導入以避免循環依賴 (pipeline 需要 pikpak_client)
-    from pikpakbot.pipeline import process_magnet, thread_list
-    from pikpakbot.notifier import NullNotifier
-
-    if notifier is None:
-        notifier = NullNotifier()
-
-    stuck_tasks = get_stuck_tasks(account, min_progress)
-
-    if not stuck_tasks:
-        logging.info(f"帳號{account}沒有找到卡住的任務 (進度 >= {min_progress}%)")
-        return 0, 0, []
-
-    logging.info(f"🔄 帳號{account}找到 {len(stuck_tasks)} 個卡住的任務 (進度 >= {min_progress}%)")
-
-    results = []
-    success_count = 0
-    fail_count = 0
-    total = len(stuck_tasks)
-
-    for i, task in enumerate(stuck_tasks, 1):
-        task_id = task['id']
-        task_name = task['name']
-        file_id = task.get('file_id')
-        progress = task['progress']
-
-        logging.info(f"[{i}/{total}] 正在處理: {task_name} ({progress}%)")
-
-        if delete_cloud_files and file_id:
-            try:
-                delete_files(file_id, account, mode='force')
-                delete_trash(file_id, account, mode='force')
-                logging.info(f"  ↳ 已刪除雲端不完整檔案")
-            except Exception as e:
-                logging.warning(f"  ↳ 刪除雲端檔案失敗 (繼續重試): {e}")
-
-        success, result = retry_offline_task(task_id, account)
-
-        if success:
-            success_count += 1
-            logging.info(f"  ↳ ✅ 已重新加入佇列")
-
-            new_task_id = result.get('task', {}).get('id') if isinstance(result, dict) else None
-            task_info = {
-                'id': new_task_id or task_id,
-                'name': task_name
-            }
-            # Per-task sub-channel so the watchdog's auto-retries don't all
-            # dump their progress + failure into the main channel. TG no-op.
-            task_notifier = notifier.create_task_channel(task_name or '卡住任務重試')
-            thread_list.append(threading.Thread(
-                target=process_magnet,
-                args=[task_notifier, None, None, None, task_info, account]
-            ))
-            thread_list[-1].start()
-            logging.info(f"  ↳ 已啟動監控線程，等待完成後將推送 Aria2")
-
-            results.append({
-                'name': task_name,
-                'progress': progress,
-                'status': 'success',
-                'message': '已重新加入佇列並啟動監控'
-            })
-        else:
-            fail_count += 1
-            logging.error(f"  ↳ ❌ 重試失敗: {result}")
-            results.append({
-                'name': task_name,
-                'progress': progress,
-                'status': 'fail',
-                'message': str(result)
-            })
-
-        sleep(2)
-
-    logging.info(f"✅ 帳號{account}重試完成: 成功 {success_count}, 失敗 {fail_count}")
-    return success_count, fail_count, results
+def retry_stuck_tasks(account, min_progress=90, delete_cloud_files=False, notifier=None,
+                      *, automatic=False):
+    # Keep the old keyword for callers, but NEVER delete data to retry.
+    from pikpakbot.pipeline import retry_offline_candidates
+    try:
+        return retry_offline_candidates(account, min_progress, notifier, automatic=automatic)
+    except (requests.RequestException, PikPakError) as exc:
+        return 0, 1, [{'name': account, 'status': 'fail', 'message': f'查詢失敗，未重試：{exc}'}]
 
 
 def get_my_vip(account):

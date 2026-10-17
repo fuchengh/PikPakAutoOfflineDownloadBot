@@ -8,8 +8,7 @@ Slash commands mirror the TG commands: /p, /clean, /retry, /path, /status,
 
 Slow sync work (login, PikPak API calls, file cleanup) is dispatched onto
 the default executor with loop.run_in_executor so we don't block Discord's
-event loop. Pipeline downloads remain in their own threading.Thread, same
-shape as the TG path.
+event loop. Discord and Telegram share the bounded download worker pool.
 """
 import asyncio
 import logging
@@ -24,11 +23,12 @@ from discord.ext import commands, tasks
 import config
 from config import USER, PASSWORD, AUTO_DELETE, record_config
 from pikpakbot import state
+from pikpakbot.links import parse_links
 from pikpakbot.notifier import DiscordNotifier
 from pikpakbot.pikpak_client import (
     login,
     registerFuc,
-    pikpak_headers,
+    forget_account,
     get_folder_all,
     get_list,
     get_stuck_tasks,
@@ -36,17 +36,15 @@ from pikpakbot.pikpak_client import (
     delete_files,
     delete_trash,
     delete_offline_tasks,
-    cancel_offline_tasks_by_name,
     empty_trash,
 )
 from pikpakbot.pipeline import (
-    process_magnet,
-    download_cloud_file,
-    thread_list,
+    submit_magnet,
+    submit_cloud_file,
+    retry_task,
     batch_results,
     batch_lock,
     check_download_thread_status,
-    cleanup_failed_download_dir,
 )
 
 
@@ -180,71 +178,18 @@ async def _path_action_autocomplete(interaction, current: str):
 
 
 async def _handle_retry_click(interaction: discord.Interaction, task_id: str):
-    task = state.get_task(task_id)
-    if not task:
-        await interaction.response.send_message(f'❌ 找不到任務 `{task_id}`', ephemeral=True)
-        return
-    magnet = task.get('magnet')
-    if not magnet:
-        await interaction.response.send_message(
-            f'❌ 任務 `{task_id}` 沒有原始 magnet，無法重試（可能是 resume 任務）',
-            ephemeral=True,
-        )
-        return
-
-    # Clean up the failed attempt's local download dir before re-running so
-    # leftover .aria2 partials and the broken big file don't pile up.
-    cleaned, cleanup_msg = await _run_sync(cleanup_failed_download_dir, task.get('name'))
-    logging.info(f"retry cleanup for {task_id} ({task.get('name')}): {cleanup_msg}")
-
-    # Also cancel any old PikPak offline tasks with the same name (the previous
-    # attempt may have left one in 'downloading' state or completed with an
-    # orphan cloud folder). delete_files=True nukes the cloud folder too so we
-    # don't end up with duplicate downloads on the PikPak side.
-    task_name = task.get('name')
-    task_account = task.get('account')
-    if task_name and task_account:
-        try:
-            matched, ok, bad = await _run_sync(
-                cancel_offline_tasks_by_name, task_account, task_name, True
-            )
-            if matched:
-                logging.info(
-                    f"retry cloud cleanup for {task_id}: matched={matched} deleted={ok} failed={bad}"
-                )
-        except Exception as e:
-            logging.warning(f"retry cloud cleanup for {task_id} failed (continuing): {e}")
-
-    # Reset the thread icon from ❌ back to 🔄 (retrying). finalize() will flip
-    # it to ✅/❌ again when the new task ends.
-    if isinstance(interaction.channel, discord.Thread):
-        try:
-            cur = interaction.channel.name
-            for prefix in ('❌ ', '✅ ', '📥 ', '🔄 '):
-                if cur.startswith(prefix):
-                    cur = cur[len(prefix):]
-                    break
-            await interaction.channel.edit(name=f'🔄 {cur}'[:100])
-        except Exception as e:
-            logging.warning(f'retry: rename thread to 🔄 failed: {e}')
-
-    notifier = DiscordNotifier(interaction.channel_id)
-    t = threading.Thread(
-        target=process_magnet,
-        args=[notifier, magnet, None, None, None, None],
-    )
-    thread_list.append(t)
-    t.start()
-
-    # Remove buttons so the user can't double-click
+    # ACK before SQLite, cleanup or provider/network operations.
+    await interaction.response.defer()
     try:
-        await interaction.response.edit_message(view=None)
-    except Exception:
-        pass
+        child = await _run_sync(retry_task, DiscordNotifier(interaction.channel_id), task_id)
+    except (ValueError, RuntimeError) as exc:
+        await interaction.followup.send(f'❌ {exc}', ephemeral=True)
+        return
     try:
-        await interaction.followup.send(f'🔄 任務 `{task_id}` 已重新加入佇列')
-    except Exception:
-        pass
+        await interaction.edit_original_response(view=None)
+    except discord.HTTPException:
+        logging.warning('Could not remove stale retry buttons for %s', task_id)
+    await interaction.followup.send(f'🔄 任務 `{task_id}` 已接續為 `{child}`', ephemeral=True)
 
 
 async def _handle_dismiss_click(interaction: discord.Interaction):
@@ -256,6 +201,8 @@ async def _handle_dismiss_click(interaction: discord.Interaction):
         except Exception:
             pass
     # If we're in a thread, archive it now that the user has dismissed the failure.
+    if any(t.get('discord_channel_id') == interaction.channel_id for t in state.list_active()):
+        return
     if isinstance(interaction.channel, discord.Thread):
         try:
             await interaction.channel.edit(archived=True)
@@ -266,6 +213,15 @@ async def _handle_dismiss_click(interaction: discord.Interaction):
 def _register_commands(bot: commands.Bot):
     """Wire all slash commands onto the bot's tree. Called once before run()."""
 
+    async def authorized(interaction):
+        allowed = {str(value) for value in getattr(config, 'DISCORD_ADMIN_IDS', [])}
+        ok = str(interaction.user.id) in allowed if allowed else await bot.is_owner(interaction.user)
+        if not ok:
+            await interaction.response.send_message('Unauthorized access', ephemeral=True)
+        return ok
+
+    bot.tree.interaction_check = authorized
+
     @bot.listen('on_interaction')
     async def on_component(interaction: discord.Interaction):
         # We only care about component (button) interactions. Slash commands are
@@ -274,6 +230,8 @@ def _register_commands(bot: commands.Bot):
             return
         data = interaction.data or {}
         custom_id = data.get('custom_id') or ''
+        if not custom_id.startswith(('retry:', 'dismiss:')) or not await authorized(interaction):
+            return
         if custom_id.startswith('retry:'):
             await _handle_retry_click(interaction, custom_id.split(':', 1)[1])
         elif custom_id.startswith('dismiss:'):
@@ -300,10 +258,14 @@ def _register_commands(bot: commands.Bot):
 
     # ---- /p submit magnets ----
     @bot.tree.command(name='p', description='Submit magnet URLs for offline + aria2 download')
-    @app_commands.describe(magnets='Magnet links (whitespace-separated). 可以一次貼多個。',
+    @app_commands.describe(magnets='Magnet / HTTP(S) / ed2k links. 可貼多個，magnet 不需空白分隔。',
                             offline_path='Optional override for the PikPak offline path (absolute)')
     async def p_cmd(interaction: discord.Interaction, magnets: str, offline_path: Optional[str] = None):
-        argv = magnets.split()
+        try:
+            argv = parse_links(magnets)
+        except ValueError as exc:
+            await interaction.response.send_message(f'❌ {exc}', ephemeral=True)
+            return
         if not argv:
             await interaction.response.send_message('Usage: /p <magnet>...', ephemeral=True)
             return
@@ -331,6 +293,7 @@ def _register_commands(bot: commands.Bot):
         # Create one thread per magnet so status spam doesn't crowd the main channel.
         # If thread creation fails (perms, DM, etc.), fall back to posting in the channel.
         parent = interaction.channel
+        submitted = 0
         for each_magnet in argv:
             target_id = interaction.channel_id
             if parent and hasattr(parent, 'create_thread'):
@@ -352,15 +315,14 @@ def _register_commands(bot: commands.Bot):
                     logging.warning(f'Discord thread 建立失敗，落回 channel: {e}')
 
             notifier = DiscordNotifier(target_id)
-            t = threading.Thread(
-                target=process_magnet,
-                args=[notifier, each_magnet, resolved_offline, batch_id, None, None],
-            )
-            thread_list.append(t)
-            t.start()
+            try:
+                await _run_sync(submit_magnet, notifier, each_magnet, resolved_offline, batch_id)
+                submitted += 1
+            except (ValueError, RuntimeError) as exc:
+                logging.warning('Submission rejected: %s', exc)
 
         path_note = f' (path={resolved_offline})' if resolved_offline else ''
-        await interaction.followup.send(f'📥 已加入 {len(argv)} 個磁力下載任務{path_note}')
+        await interaction.followup.send(f'📥 已加入 {submitted}/{len(argv)} 個下載任務{path_note}')
 
     # ---- /status ----
     @bot.tree.command(name='status', description='List in-flight tasks')
@@ -421,7 +383,7 @@ def _register_commands(bot: commands.Bot):
             return
         await interaction.response.defer()
         folder = '' if (not folder_id or folder_id == 'root') else folder_id
-        location = f'root (/)' if not folder else f'folder `{folder}`'
+        location = 'root (/)' if not folder else f'folder `{folder}`'
         header = f'📂 PikPak: **{location}** — 帳號 `{target_account}`'
 
         try:
@@ -481,9 +443,11 @@ def _register_commands(bot: commands.Bot):
                 logging.warning(f'Discord thread 建立失敗，落回 channel: {e}')
 
         notifier = DiscordNotifier(target_id)
-        t = threading.Thread(target=download_cloud_file, args=[notifier, file_id, target_account])
-        thread_list.append(t)
-        t.start()
+        try:
+            await _run_sync(submit_cloud_file, notifier, file_id, target_account)
+        except (ValueError, RuntimeError) as exc:
+            await interaction.followup.send(f'❌ {exc}', ephemeral=True)
+            return
 
         await interaction.followup.send(
             f'📥 已開始下載 PikPak file `{file_id}` (帳號 `{target_account}`)'
@@ -519,9 +483,9 @@ def _register_commands(bot: commands.Bot):
 
     # ---- /retry ----
     @bot.tree.command(name='retry', description='Retry stuck offline tasks')
-    @app_commands.describe(threshold='Progress threshold (0-100, default 90)')
+    @app_commands.describe(threshold='Stalled-task progress (0-100, default 90); all ERROR tasks are included')
     async def retry_cmd(interaction: discord.Interaction, threshold: Optional[int] = 90):
-        threshold = max(0, min(100, threshold or 90))
+        threshold = max(0, min(100, 90 if threshold is None else threshold))
         await interaction.response.defer()
         notifier = DiscordNotifier(interaction.channel_id)
 
@@ -530,40 +494,45 @@ def _register_commands(bot: commands.Bot):
             total_fail = 0
             all_lines = []
             for account in USER:
-                s, f, results = retry_stuck_tasks(account, threshold, delete_cloud_files=True, notifier=notifier)
+                s, f, results = retry_stuck_tasks(account, threshold, delete_cloud_files=False, notifier=notifier)
                 total_success += s
                 total_fail += f
                 for r in results:
                     icon = '✅' if r['status'] == 'success' else '❌'
-                    all_lines.append(f"{icon} {r['name']}")
+                    all_lines.append(f"{icon} {r['name']} — {r.get('message', '')}")
             if total_success + total_fail == 0:
-                notifier.send(f'✅ 沒有找到進度 >= {threshold}% 的卡住任務')
+                notifier.send(f'✅ 沒有可重試的失敗或停滯任務（停滯進度 >= {threshold}%）')
                 return
             msg = f"📋 **重試結果**\n✅ 成功: {total_success}  ❌ 失敗: {total_fail}\n" + '\n'.join(all_lines)
             notifier.send(msg)
 
         threading.Thread(target=_do_retry, daemon=True).start()
-        await interaction.followup.send(f'🔄 正在重試進度 >= {threshold}% 的卡住任務...')
+        await interaction.followup.send(f'🔄 正在檢查失敗與停滯任務（停滯進度 >= {threshold}%）...')
 
     @bot.tree.command(name='retry-list', description='List stuck offline tasks (no action)')
-    @app_commands.describe(threshold='Progress threshold (0-100, default 90)')
+    @app_commands.describe(threshold='Stalled-task progress (0-100, default 90); all ERROR tasks are included')
     async def retry_list_cmd(interaction: discord.Interaction, threshold: Optional[int] = 90):
-        threshold = max(0, min(100, threshold or 90))
+        threshold = max(0, min(100, 90 if threshold is None else threshold))
         await interaction.response.defer()
 
         def _do_list():
-            lines = [f'📋 **卡住的任務列表** (進度 >= {threshold}%)']
-            total = 0
+            lines = [f'📋 **失敗與停滯任務** (停滯進度 >= {threshold}%)']
+            total = failures = 0
             for account in USER:
-                stuck = get_stuck_tasks(account, threshold)
+                try:
+                    stuck = get_stuck_tasks(account, threshold)
+                except Exception as exc:
+                    failures += 1
+                    lines.append(f'❌ {account} 查詢失敗：{exc}')
+                    continue
                 if stuck:
                     lines.append(f"\n**帳號: {account}**")
                     for t in stuck:
                         lines.append(f"  • {t['name']} ({t['progress']}%)")
                     total += len(stuck)
-            if total == 0:
+            if total == 0 and not failures:
                 lines.append('\n✅ 沒有找到卡住的任務')
-            else:
+            elif total:
                 lines.append(f'\n共 {total} 個任務卡住')
             return '\n'.join(lines)[:2000]
 
@@ -614,9 +583,12 @@ def _register_commands(bot: commands.Bot):
     @bot.tree.command(name='account-add', description='Add a PikPak account (prepend to list)')
     @app_commands.describe(account='Account (email/phone)', password='Account password')
     async def account_add_cmd(interaction: discord.Interaction, account: str, password: str):
+        if check_download_thread_status():
+            await interaction.response.send_message('下載任務執行中，請完成後再修改帳號', ephemeral=True)
+            return
         USER.insert(0, account)
         PASSWORD.insert(0, password)
-        pikpak_headers.insert(0, None)
+        forget_account(account)
         record_config()
         await interaction.response.send_message(f'已加入帳號 `{account}`', ephemeral=True)
 
@@ -625,6 +597,9 @@ def _register_commands(bot: commands.Bot):
     @app_commands.describe(account='Account to remove')
     @app_commands.autocomplete(account=_account_autocomplete)
     async def account_delete_cmd(interaction: discord.Interaction, account: str):
+        if check_download_thread_status():
+            await interaction.response.send_message('下載任務執行中，請完成後再修改帳號', ephemeral=True)
+            return
         try:
             idx = USER.index(account)
         except ValueError:
@@ -632,7 +607,7 @@ def _register_commands(bot: commands.Bot):
             return
         USER.pop(idx)
         PASSWORD.pop(idx)
-        pikpak_headers.pop(idx)
+        forget_account(account)
         AUTO_DELETE.pop(account, None)
         record_config()
         await interaction.response.send_message(f'已刪除帳號 `{account}`')
@@ -655,6 +630,9 @@ def _register_commands(bot: commands.Bot):
     # ---- /account-new (register a free PikPak account) ----
     @bot.tree.command(name='account-new', description='Register a free PikPak account')
     async def account_new_cmd(interaction: discord.Interaction):
+        if check_download_thread_status():
+            await interaction.response.send_message('下載任務執行中，請完成後再修改帳號', ephemeral=True)
+            return
         await interaction.response.defer(ephemeral=True)
         register = await _run_sync(registerFuc)
         if not register:
@@ -662,7 +640,7 @@ def _register_commands(bot: commands.Bot):
             return
         USER.insert(0, register['account'])
         PASSWORD.insert(0, register['password'])
-        pikpak_headers.insert(0, None)
+        forget_account(register['account'])
         record_config()
         await interaction.followup.send(f"已註冊新帳號 `{register['account']}`", ephemeral=True)
 

@@ -1,11 +1,11 @@
 """SQLite-backed task state registry.
 
-Records each magnet processed by `pipeline.process_magnet` so /status and
+Records each source and retry attempt so /status and
 /history can answer "what's running?" and "what failed?" across restarts.
 
-One row per magnet. `stage` advances through: queued -> offline -> download ->
+One row per attempt. `stage` advances through: queued -> offline -> download ->
 cleanup -> complete (or failed at any point). The /retry button on a failure
-notification looks up the original magnet here.
+notification looks up persisted source IDs and per-file state here.
 """
 import logging
 import os
@@ -29,6 +29,22 @@ TERMINAL_STAGES = (STAGE_COMPLETE, STAGE_FAILED, STAGE_CANCELED)
 _lock = threading.Lock()
 _conn = None
 
+# Additive migration: preserve every old row, including failures without IDs.
+_EXTRA_COLUMNS = {
+    'source_kind': "TEXT DEFAULT 'magnet'", 'offline_path': 'TEXT',
+    'cloud_task_id': 'TEXT', 'cloud_file_id': 'TEXT',
+    'retry_of': 'TEXT', 'retry_child': 'TEXT', 'retry_requested': 'INTEGER DEFAULT 0',
+    'auto_retries': 'INTEGER DEFAULT 0', 'last_progress_at': 'REAL',
+    'discord_channel_id': 'INTEGER', 'discord_message_id': 'INTEGER',
+    'manifest_ready': 'INTEGER DEFAULT 0',
+    'submission_started': 'INTEGER DEFAULT 0', 'interrupted_stage': 'TEXT',
+    'last_retry_at': 'REAL',
+}
+
+
+class TaskConflict(ValueError):
+    pass
+
 
 def _init_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -49,6 +65,24 @@ def _init_conn():
     ''')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_stage ON tasks(stage)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_updated ON tasks(updated_at)')
+    columns = {r[1] for r in conn.execute('PRAGMA table_info(tasks)')}
+    for name, definition in _EXTRA_COLUMNS.items():
+        if name not in columns:
+            conn.execute(f'ALTER TABLE tasks ADD COLUMN {name} {definition}')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_cloud_task ON tasks(account, cloud_task_id)')
+    conn.execute('''CREATE TABLE IF NOT EXISTS claims (
+        resource TEXT PRIMARY KEY, task_id TEXT NOT NULL)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS resource_history (
+        resource TEXT NOT NULL, task_id TEXT NOT NULL, PRIMARY KEY(resource, task_id))''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS task_files (
+        task_id TEXT NOT NULL, file_id TEXT NOT NULL, name TEXT NOT NULL,
+        directory TEXT NOT NULL, gid TEXT, status TEXT NOT NULL DEFAULT 'pending',
+        size INTEGER NOT NULL DEFAULT 0, error TEXT,
+        PRIMARY KEY(task_id, file_id))''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS observations (
+        account TEXT NOT NULL, cloud_task_id TEXT NOT NULL,
+        progress INTEGER NOT NULL, phase TEXT, changed_at REAL NOT NULL,
+        seen_at REAL NOT NULL, PRIMARY KEY(account, cloud_task_id))''')
     conn.commit()
     return conn
 
@@ -60,7 +94,7 @@ def _conn_ref():
     return _conn
 
 
-def create_task(magnet=None, name=None, account=None, stage=STAGE_QUEUED):
+def create_task(magnet=None, name=None, account=None, stage=STAGE_QUEUED, **fields):
     task_id = uuid.uuid4().hex[:8]
     now = time.time()
     with _lock:
@@ -71,12 +105,18 @@ def create_task(magnet=None, name=None, account=None, stage=STAGE_QUEUED):
             (task_id, magnet, name, account, stage, now, now),
         )
         c.commit()
+    if fields:
+        update_task(task_id, **fields)
     return task_id
 
 
 def update_task(task_id, **fields):
     if not fields or not task_id:
         return
+    allowed = set(_EXTRA_COLUMNS) | {'magnet', 'name', 'account', 'stage', 'progress',
+                                     'error', 'completed_at', 'updated_at'}
+    if not set(fields) <= allowed:
+        raise ValueError('Unknown task field')
     fields['updated_at'] = time.time()
     if fields.get('stage') in TERMINAL_STAGES and 'completed_at' not in fields:
         fields['completed_at'] = time.time()
@@ -138,7 +178,7 @@ def mark_failed_if_not_terminal(task_id, error_message):
 def sweep_interrupted():
     """At boot, mark all non-terminal tasks as failed.
 
-    process_magnet's `finally` block calls mark_failed_if_not_terminal, but
+    The worker's `finally` block calls mark_failed_if_not_terminal, but
     that only runs if python can unwind the thread normally. systemctl
     restart sends SIGTERM and the threads die mid-execution, so any task
     that was in OFFLINE/DOWNLOAD/CLEANUP when the bot died stays that way
@@ -151,8 +191,6 @@ def sweep_interrupted():
     Returns the number of rows updated.
     """
     actives = list_active()
-    if not actives:
-        return 0
     for t in actives:
         completed_at = t.get('updated_at') or time.time()
         update_task(
@@ -160,5 +198,156 @@ def sweep_interrupted():
             stage=STAGE_FAILED,
             error='bot restarted while task was in flight',
             completed_at=completed_at,
+            interrupted_stage=t['stage'],
         )
+    with _lock:
+        c = _conn_ref()
+        c.execute("DELETE FROM claims WHERE resource NOT LIKE 'path:%' AND resource NOT LIKE 'cloud-file:%'")
+        c.execute("DELETE FROM claims WHERE task_id IN (SELECT task_id FROM tasks WHERE stage='complete')")
+        c.commit()
     return len(actives)
+
+
+def claim(task_id, resource):
+    """One owner per source, provider ID or output path, across all entry points."""
+    with _lock:
+        c = _conn_ref()
+        row = c.execute('SELECT task_id FROM claims WHERE resource=?', (resource,)).fetchone()
+        if row and row[0] != task_id:
+            # Failed downloads can still be running in aria2 after an RPC outage.
+            # Transfer their persistent file/path reservations only to a retry child.
+            ancestor = task_id
+            while ancestor:
+                parent = c.execute('SELECT retry_of FROM tasks WHERE task_id=?', (ancestor,)).fetchone()
+                ancestor = parent[0] if parent else None
+                if ancestor == row[0] and resource.startswith(('path:', 'cloud-file:')):
+                    c.execute('UPDATE claims SET task_id=? WHERE resource=?', (task_id, resource))
+                    break
+            else:
+                raise TaskConflict(f'此資源由任務 {row[0]} 處理中或保留供重試')
+        c.execute('INSERT OR IGNORE INTO claims VALUES (?, ?)', (resource, task_id))
+        if resource.startswith('cloud-task:'):
+            c.execute('INSERT OR IGNORE INTO resource_history VALUES (?, ?)', (resource, task_id))
+        c.commit()
+
+
+def release(task_id, *, preserve_files=False):
+    with _lock:
+        c = _conn_ref()
+        uncertain = preserve_files and c.execute(
+            "SELECT 1 FROM task_files WHERE task_id=? AND gid IS NOT NULL AND status!='complete'",
+            (task_id,)).fetchone()
+        if uncertain:
+            c.execute("DELETE FROM claims WHERE task_id=? AND resource NOT LIKE 'path:%' "
+                      "AND resource NOT LIKE 'cloud-file:%'", (task_id,))
+        else:
+            c.execute('DELETE FROM claims WHERE task_id=?', (task_id,))
+        c.commit()
+
+
+def claim_retry(task_id):
+    """Atomically create a single child attempt; stale buttons stay consumed."""
+    with _lock:
+        c = _conn_ref()
+        with c:
+            c.execute('BEGIN IMMEDIATE')
+            old = c.execute('SELECT * FROM tasks WHERE task_id=?', (task_id,)).fetchone()
+            if not old:
+                raise TaskConflict('找不到任務')
+            old = dict(old)
+            if old['stage'] not in (STAGE_FAILED, STAGE_CANCELED) or old['retry_child']:
+                raise TaskConflict('任務仍在執行、已完成，或已經重試；請使用最新任務的按鈕')
+            if c.execute("SELECT 1 FROM claims WHERE task_id=? AND resource NOT LIKE 'path:%' "
+                         "AND resource NOT LIKE 'cloud-file:%'", (task_id,)).fetchone():
+                raise TaskConflict('上一個任務仍在收尾，請稍後再試')
+            if not any(old[k] for k in ('magnet', 'cloud_task_id', 'cloud_file_id')):
+                raise TaskConflict('舊記錄沒有來源 ID；請重新貼上 magnet 或使用 /dl file_id')
+            child = uuid.uuid4().hex[:8]
+            now = time.time()
+            fields = {k: old[k] for k in ('magnet', 'name', 'account', 'source_kind',
+                      'offline_path', 'cloud_task_id', 'cloud_file_id', 'manifest_ready',
+                      'discord_channel_id', 'discord_message_id')}
+            fields.update(task_id=child, stage=STAGE_QUEUED, retry_of=task_id,
+                          created_at=now, updated_at=now)
+            cols = ','.join(fields)
+            c.execute(f'INSERT INTO tasks ({cols}) VALUES ({",".join("?" for _ in fields)})',
+                      list(fields.values()))
+            c.execute('UPDATE tasks SET retry_child=? WHERE task_id=?', (child, task_id))
+            c.execute('''INSERT INTO task_files
+                SELECT ?, file_id, name, directory, gid, status, size, error
+                FROM task_files WHERE task_id=?''', (child, task_id))
+    return child
+
+
+def latest_cloud_task(account, cloud_task_id):
+    with _lock:
+        row = _conn_ref().execute('''SELECT * FROM tasks WHERE (account=? AND cloud_task_id=?)
+                    OR task_id IN (SELECT task_id FROM resource_history WHERE resource=?)
+                    ORDER BY created_at DESC LIMIT 1''',
+                    (account, cloud_task_id, f'cloud-task:{account}:{cloud_task_id}')).fetchone()
+    return dict(row) if row else None
+
+
+def request_offline_retry(task_id):
+    """Coalesce repeated /retry requests while the existing owner is working."""
+    with _lock:
+        c = _conn_ref()
+        result = c.execute('''UPDATE tasks SET retry_requested=1 WHERE task_id=? AND stage=?
+                              AND retry_requested=0 AND COALESCE(last_retry_at,0)<=?''',
+                           (task_id, STAGE_OFFLINE, time.time() - 60))
+        c.commit()
+        return result.rowcount == 1
+
+
+def save_file(task_id, file_id, name, directory, **fields):
+    with _lock:
+        c = _conn_ref()
+        c.execute('''INSERT OR IGNORE INTO task_files(task_id,file_id,name,directory)
+                     VALUES (?,?,?,?)''', (task_id, file_id, name, directory))
+        if fields:
+            if not set(fields) <= {'gid', 'status', 'size', 'error'}:
+                raise ValueError('Unknown file field')
+            c.execute(f'UPDATE task_files SET {",".join(k + "=?" for k in fields)} '
+                      'WHERE task_id=? AND file_id=?', [*fields.values(), task_id, file_id])
+        c.commit()
+
+
+def files(task_id):
+    with _lock:
+        return [dict(r) for r in _conn_ref().execute(
+            'SELECT * FROM task_files WHERE task_id=?', (task_id,))]
+
+
+def set_manifest(task_id, name, file_id, entries):
+    with _lock:
+        c = _conn_ref()
+        with c:
+            c.execute('DELETE FROM task_files WHERE task_id=?', (task_id,))
+            c.executemany('INSERT INTO task_files(task_id,file_id,name,directory) VALUES (?,?,?,?)',
+                          [(task_id, *entry) for entry in entries])
+            c.execute('UPDATE tasks SET name=?,cloud_file_id=?,manifest_ready=1 WHERE task_id=?',
+                      (name, file_id, task_id))
+
+
+def observe(account, tasks, now=None):
+    """Return seconds unchanged, requiring continuous successful observations."""
+    now = time.time() if now is None else now
+    ages = {}
+    with _lock:
+        c = _conn_ref()
+        for task in tasks:
+            key = task.get('id')
+            if not key:
+                continue
+            progress = int(task.get('progress') or 0)
+            phase = task.get('phase')
+            old = c.execute('SELECT * FROM observations WHERE account=? AND cloud_task_id=?',
+                            (account, key)).fetchone()
+            changed = (not old or old['progress'] != progress or old['phase'] != phase
+                       or now - old['seen_at'] > 600)
+            changed_at = now if changed else old['changed_at']
+            c.execute('INSERT OR REPLACE INTO observations VALUES (?,?,?,?,?,?)',
+                      (account, key, progress, phase, changed_at, now))
+            ages[key] = now - changed_at
+        c.commit()
+    return ages

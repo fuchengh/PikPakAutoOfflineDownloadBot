@@ -3,7 +3,7 @@ import threading
 
 import config
 from config import ADMIN_IDS
-from pikpakbot import updater, dispatcher, state
+from pikpakbot import build_telegram, state
 from pikpakbot.bot.telegram import register_handlers
 from pikpakbot.notifier import CompositeNotifier, DiscordNotifier, NullNotifier, TelegramNotifier
 from pikpakbot.pipeline import startup_recovery, stuck_task_watchdog
@@ -31,7 +31,7 @@ def _maybe_start_discord():
     return True
 
 
-def _build_admin_notifier(discord_enabled: bool):
+def _build_admin_notifier(discord_enabled: bool, updater):
     """Compose the notifier used for autonomous events (recovery, watchdog).
 
     Fans out to TG admin + Discord channel so a single bot dying doesn't
@@ -50,6 +50,8 @@ def _build_admin_notifier(discord_enabled: bool):
 
 def main():
     _configure_logging()
+    updater = build_telegram()
+    dispatcher = updater.dispatcher
 
     # Clean up any state rows left in non-terminal stages by the previous run
     # (bot was killed before threads could mark themselves failed). Do this
@@ -62,7 +64,15 @@ def main():
     register_handlers(dispatcher)
     discord_enabled = _maybe_start_discord()
 
-    admin_notifier = _build_admin_notifier(discord_enabled)
+    admin_notifier = _build_admin_notifier(discord_enabled, updater)
+
+    if discord_enabled:
+        from time import sleep
+        from pikpakbot.bot.discord_bot import is_ready
+        for _ in range(30):
+            if is_ready():
+                break
+            sleep(1)
 
     threading.Thread(target=startup_recovery, args=(admin_notifier,), daemon=True).start()
     threading.Thread(target=stuck_task_watchdog, args=(admin_notifier,), daemon=True).start()
