@@ -1,10 +1,8 @@
-from telegram.ext import Updater
+"""Importing state/clients must not initialize a bot or contact Telegram."""
 
-from config import TG_API_URL, TOKEN
 
-if TG_API_URL[-1] == '/':
-    updater = Updater(token=TOKEN, base_url=f"{TG_API_URL}bot", base_file_url=f"{TG_API_URL}file/bot")
-else:
-    updater = Updater(token=TOKEN, base_url=f"{TG_API_URL}/bot", base_file_url=f"{TG_API_URL}/file/bot")
-
-dispatcher = updater.dispatcher
+def build_telegram():
+    from telegram.ext import Updater
+    from config import TG_API_URL, TOKEN
+    base = TG_API_URL.rstrip('/')
+    return Updater(token=TOKEN, base_url=f'{base}/bot', base_file_url=f'{base}/file/bot')

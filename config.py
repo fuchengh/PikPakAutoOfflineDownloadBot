@@ -24,27 +24,50 @@ PIKPAK_OFFLINE_PATH = "None"
 # Discord bot (optional). Leave DISCORD_TOKEN empty to disable.
 DISCORD_TOKEN = ''
 DISCORD_CHANNEL_ID = 0  # int — channel where Discord side posts autonomous notifications
+DISCORD_ADMIN_IDS = []  # Discord user IDs; empty permits only the application owner/team
+DOWNLOAD_WORKERS = 4
+MAX_QUEUED_TASKS = 128  # running + waiting
+OFFLINE_STALL_SECONDS = 1200
+OFFLINE_MAX_SECONDS = 7200
+ARIA2_STALL_SECONDS = 3600
+MAX_AUTO_RETRIES = 3
 
 
 def record_config():
     import logging
     import os
 
-    config_path = os.path.abspath(os.path.dirname(__file__)) + '/config.py'
-    with open(config_path, 'w') as f:
-        f.write(
-            f'TOKEN = "{TOKEN}"\n'
-            f'ADMIN_IDS = {ADMIN_IDS}\n'
-            f'USER = {USER}\n'
-            f'PASSWORD = {PASSWORD}\n'
-            f'AUTO_DELETE = {AUTO_DELETE}\n'
-            f'ARIA2_HTTPS = {ARIA2_HTTPS}\n'
-            f'ARIA2_HOST = "{ARIA2_HOST}"\n'
-            f'ARIA2_PORT = "{ARIA2_PORT}"\n'
-            f'ARIA2_SECRET = "{ARIA2_SECRET}"\n'
-            f'ARIA2_DOWNLOAD_PATH = "{ARIA2_DOWNLOAD_PATH}"\n'
-            f'TG_API_URL = "{TG_API_URL}"\n'
-            f'PIKPAK_OFFLINE_PATH = "{PIKPAK_OFFLINE_PATH}"\n'
-            f'DISCORD_TOKEN = "{DISCORD_TOKEN}"\n'
-            f'DISCORD_CHANNEL_ID = {DISCORD_CHANNEL_ID}\n')
+    # Keep the functions and comments in this file; update only literal settings.
+    import ast
+    import stat
+    import tempfile
+    config_path = os.path.abspath(__file__)
+    with open(config_path, encoding='utf-8') as source:
+        original_stat = os.fstat(source.fileno())
+        lines = source.readlines()
+    updates = []
+    for node in ast.parse(''.join(lines)).body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name) and target.id.isupper() and target.id in globals():
+                updates.append((node.lineno - 1, node.end_lineno, f'{target.id} = {globals()[target.id]!r}\n'))
+    for start, end, text in reversed(updates):
+        lines[start:end] = [text]
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=os.path.dirname(config_path),
+                                         delete=False) as output:
+            temporary = output.name
+            output.writelines(lines)
+            output.flush()
+            if hasattr(os, 'fchown'):
+                current_stat = os.fstat(output.fileno())
+                if (current_stat.st_uid, current_stat.st_gid) != (original_stat.st_uid, original_stat.st_gid):
+                    os.fchown(output.fileno(), original_stat.st_uid, original_stat.st_gid)
+            # chown can clear permission bits, so restore the mode afterwards.
+            os.chmod(temporary, stat.S_IMODE(original_stat.st_mode))
+        os.replace(temporary, config_path)
+    finally:
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)
     logging.info('已更新config.py文件')

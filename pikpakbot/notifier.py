@@ -1,20 +1,27 @@
-"""Notifier abstraction so pipeline code stays bot-agnostic.
+"""Telegram and Discord notifications for shared download workers.
 
-Pipeline functions (process_magnet, record_batch_result, startup_recovery,
-stuck_task_watchdog) used to call `context.bot.send_message(...)` or
-`updater.bot.send_message(...)` directly. After this abstraction:
-
-- TG handlers build a TelegramNotifier bound to the originating chat and pass
-  it into pipeline calls — so responses reach whoever asked.
-- main.py builds an admin Notifier (TG-only today, Composite(TG, Discord)
-  once Discord lands) and passes it to autonomous pieces like
-  startup_recovery and stuck_task_watchdog.
-- Discord can later add a DiscordNotifier that schedules sends onto the
-  Discord asyncio loop via run_coroutine_threadsafe.
+Discord operations are serialized per channel; progress IDs survive retries
+and restarts through SQLite state.
 """
 from __future__ import annotations
 
 import logging
+import asyncio
+import weakref
+
+from pikpakbot import state
+
+_channel_locks = weakref.WeakValueDictionary()
+
+
+def _channel_lock(channel_id):
+    key = (asyncio.get_running_loop(), channel_id)
+    lock = _channel_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _channel_locks[key] = lock
+    return lock
+
 from dataclasses import dataclass
 from typing import Iterable, Optional, Protocol
 
@@ -124,6 +131,11 @@ class CompositeNotifier:
     def __init__(self, *notifiers):
         self._notifiers = [n for n in notifiers if n is not None]
 
+    def bind_task(self, task_id):
+        for n in self._notifiers:
+            if hasattr(n, 'bind_task'):
+                n.bind_task(task_id)
+
     def send(self, text, *, parse_mode=None, buttons=None):
         for n in self._notifiers:
             try:
@@ -208,9 +220,18 @@ class DiscordNotifier:
     def __init__(self, channel_id):
         self.channel_id = int(channel_id) if channel_id else 0
         # slot_key -> message_id. Mutated only inside the asyncio loop
-        # coroutines below, so no lock needed.
+        # coroutines below under the shared channel lock.
         self._progress_msgs = {}
         self._progress_last_text = {}
+        self._finalized = False
+        self._last_delivery_ok = False
+        self._begun = False
+
+    def bind_task(self, task_id):
+        row = state.get_task(task_id)
+        if row and row.get('discord_channel_id') != self.channel_id:
+            state.update_task(task_id, discord_channel_id=self.channel_id, discord_message_id=None)
+
 
     def send(self, text, *, parse_mode=None, buttons=None):
         # Lazy import to keep notifier.py importable when discord.py isn't installed.
@@ -234,6 +255,10 @@ class DiscordNotifier:
             logging.error(f"DiscordNotifier scheduling failed: {e}")
 
     async def _send_async(self, client, text, buttons):
+        async with _channel_lock(self.channel_id):
+            return await self._send_unlocked(client, text, buttons)
+
+    async def _send_unlocked(self, client, text, buttons):
         try:
             channel = client.get_channel(self.channel_id)
             if channel is None:
@@ -282,7 +307,14 @@ class DiscordNotifier:
             logging.error(f"DiscordNotifier progress scheduling failed: {e}")
 
     async def _progress_async(self, client, slot_key, text):
+        async with _channel_lock(self.channel_id):
+            return await self._progress_unlocked(client, slot_key, text)
+
+    async def _progress_unlocked(self, client, slot_key, text):
         import discord
+        if self._finalized or self._progress_last_text.get(slot_key) == text:
+            return
+        self._last_delivery_ok = False
         try:
             channel = client.get_channel(self.channel_id)
             if channel is None:
@@ -291,27 +323,51 @@ class DiscordNotifier:
             logging.error(f"DiscordNotifier progress: channel {self.channel_id} not found: {e}")
             return
 
+        row = state.get_task(slot_key)
+        if row and not self._begun:
+            self._begun = True
+            if isinstance(channel, discord.Thread) and channel.archived:
+                try:
+                    await channel.edit(archived=False)
+                except Exception as exc:
+                    logging.warning('Could not reopen task thread: %s', exc)
         embed = discord.Embed(description=text[:4000], color=_color_for_text(text))
         msg_id = self._progress_msgs.get(slot_key)
+        if not msg_id and row and row.get('discord_channel_id') == self.channel_id:
+            msg_id = row.get('discord_message_id')
+            parent_id = row.get('retry_of')
+            while not msg_id and parent_id:
+                parent = state.get_task(parent_id)
+                if not parent or parent.get('discord_channel_id') != self.channel_id:
+                    break
+                msg_id, parent_id = parent.get('discord_message_id'), parent.get('retry_of')
+            if msg_id:
+                self._progress_msgs[slot_key] = msg_id
         if msg_id:
             try:
-                msg = await channel.fetch_message(msg_id)
+                msg = channel.get_partial_message(msg_id)
                 await msg.edit(embed=embed)
                 self._progress_last_text[slot_key] = text
+                self._last_delivery_ok = True
+                if row:
+                    state.update_task(slot_key, discord_message_id=msg_id)
                 return
             except discord.NotFound:
                 # Message was deleted; fall through and post a fresh one
                 self._progress_msgs.pop(slot_key, None)
                 self._progress_last_text.pop(slot_key, None)
             except Exception as e:
-                logging.warning(f"DiscordNotifier progress edit failed ({e}); will re-send")
-                self._progress_msgs.pop(slot_key, None)
-                self._progress_last_text.pop(slot_key, None)
+                logging.warning(f"DiscordNotifier progress edit failed ({e}); retaining message ID")
+                return
 
         try:
             new_msg = await channel.send(embed=embed)
             self._progress_msgs[slot_key] = new_msg.id
             self._progress_last_text[slot_key] = text
+            self._last_delivery_ok = True
+            if row:
+                state.update_task(slot_key, discord_channel_id=self.channel_id,
+                                  discord_message_id=new_msg.id)
         except Exception as e:
             logging.error(f"DiscordNotifier progress send failed: {e}")
 
@@ -321,7 +377,7 @@ class DiscordNotifier:
         Synchronous wrapper — blocks the calling thread for up to a few seconds
         while Discord creates the thread. Acceptable: callers (startup_recovery,
         retry_stuck_tasks) already run in their own background threads. Falls
-        back to self on any failure so the resumed task still gets notifications.
+        back to a fresh notifier for this channel if thread creation fails.
         """
         from pikpakbot.bot import discord_bot
 
@@ -331,7 +387,7 @@ class DiscordNotifier:
                 f"DiscordNotifier create_task_channel falling back to main channel "
                 f"(ready={client.is_ready() if client else False})"
             )
-            return self
+            return DiscordNotifier(self.channel_id)
 
         import asyncio
         try:
@@ -342,10 +398,10 @@ class DiscordNotifier:
             thread_id = future.result(timeout=15)
         except Exception as e:
             logging.warning(f"DiscordNotifier create_task_channel failed ({e}); falling back to main channel")
-            return self
+            return DiscordNotifier(self.channel_id)
 
         if not thread_id:
-            return self
+            return DiscordNotifier(self.channel_id)
         return DiscordNotifier(thread_id)
 
     async def _create_thread_async(self, client, name):
@@ -393,7 +449,12 @@ class DiscordNotifier:
             logging.error(f"DiscordNotifier finalize scheduling failed: {e}")
 
     async def _finalize_async(self, client, success, name):
+        async with _channel_lock(self.channel_id):
+            return await self._finalize_unlocked(client, success, name)
+
+    async def _finalize_unlocked(self, client, success, name):
         import discord
+        self._finalized = True
         try:
             channel = client.get_channel(self.channel_id)
             if channel is None:
@@ -406,10 +467,13 @@ class DiscordNotifier:
         if not isinstance(channel, discord.Thread):
             return
 
+        if any(row.get('discord_channel_id') == self.channel_id for row in state.list_active()):
+            return
+
         icon = '✅' if success else '❌'
         new_name = f'{icon} {name}'[:100]  # Discord thread name cap
         try:
-            if success:
+            if success and self._last_delivery_ok:
                 # Rename and archive in one edit; archived threads are hidden from
                 # the active list but still browsable.
                 await channel.edit(name=new_name, archived=True)

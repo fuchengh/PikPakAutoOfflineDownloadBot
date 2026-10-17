@@ -1,9 +1,9 @@
 import logging
 import os
 import re
-import threading
 import time
 import uuid
+from html import escape
 
 import telegram
 from telegram import Update
@@ -12,11 +12,12 @@ from telegram.ext import CallbackContext, CallbackQueryHandler, CommandHandler, 
 import config
 from config import ADMIN_IDS, USER, PASSWORD, AUTO_DELETE, record_config
 from pikpakbot import state
+from pikpakbot.links import parse_links
 from pikpakbot.notifier import TelegramNotifier
 from pikpakbot.pikpak_client import (
     login,
     registerFuc,
-    pikpak_headers,
+    forget_account,
     get_folder_all,
     get_list,
     get_stuck_tasks,
@@ -24,18 +25,16 @@ from pikpakbot.pikpak_client import (
     delete_files,
     delete_trash,
     delete_offline_tasks,
-    cancel_offline_tasks_by_name,
     empty_trash,
     get_my_vip,
 )
 from pikpakbot.pipeline import (
-    process_magnet,
-    download_cloud_file,
-    thread_list,
+    submit_magnet,
+    submit_cloud_file,
+    retry_task,
     batch_results,
     batch_lock,
     check_download_thread_status,
-    cleanup_failed_download_dir,
 )
 
 
@@ -128,6 +127,13 @@ def pikpak(update: Update, context: CallbackContext):
         else:
             temp_offline_path = None
 
+        try:
+            argv = parse_links(' '.join(argv))
+            if not argv:
+                raise ValueError('請提供至少一個下載連結')
+        except ValueError as exc:
+            context.bot.send_message(chat_id=update.effective_chat.id, text=f'❌ {exc}')
+            return
         offline_path = None
         if temp_offline_path:
             offline_path = temp_offline_path
@@ -149,11 +155,10 @@ def pikpak(update: Update, context: CallbackContext):
                 'notifier': notifier,
             }
         for each_magnet in argv:
-            thread_list.append(threading.Thread(
-                target=process_magnet,
-                args=[notifier, each_magnet, offline_path, batch_id]
-            ))
-            thread_list[-1].start()
+            try:
+                submit_magnet(notifier, each_magnet, offline_path, batch_id)
+            except (ValueError, RuntimeError) as exc:
+                logging.warning('Submission rejected: %s', exc)
 
             mag_url_part = re.search(r'^(magnet:\?).*(xt=.+?)(&|$)', each_magnet)
             if mag_url_part:
@@ -320,6 +325,9 @@ def print_user_auto_delete():
 
 def account_manage(update: Update, context: CallbackContext):
     argv = context.args
+    if argv and argv[0] in ('a', 'add', 'd', 'delete', 'n', 'new') and check_download_thread_status():
+        context.bot.send_message(chat_id=update.effective_chat.id, text='下載任務執行中，請完成後再修改帳號')
+        return
 
     if len(argv) == 0:
         context.bot.send_message(chat_id=update.effective_chat.id,
@@ -357,7 +365,7 @@ def account_manage(update: Update, context: CallbackContext):
         if len(argv) == 3:
             USER.insert(0, argv[1])
             PASSWORD.insert(0, argv[2])
-            pikpak_headers.insert(0, None)
+            forget_account(argv[1])
             record_config()
 
             print_info = print_user()
@@ -371,7 +379,7 @@ def account_manage(update: Update, context: CallbackContext):
             if register:
                 USER.insert(0, register['account'])
                 PASSWORD.insert(0, register['password'])
-                pikpak_headers.insert(0, None)
+                forget_account(register['account'])
                 record_config()
                 print_info = print_user()
                 context.bot.send_message(chat_id=update.effective_chat.id, text=print_info, parse_mode='Markdown')
@@ -390,7 +398,7 @@ def account_manage(update: Update, context: CallbackContext):
                     continue
                 USER.pop(temp_account_index)
                 PASSWORD.pop(temp_account_index)
-                pikpak_headers.pop(temp_account_index)
+                forget_account(each_account)
 
                 if each_account in AUTO_DELETE:
                     AUTO_DELETE.pop(each_account)
@@ -497,22 +505,27 @@ def retry(update: Update, context: CallbackContext):
 
     if len(argv) >= 1 and argv[0] in ['list', 'l']:
         list_min_progress = int(argv[1]) if len(argv) >= 2 else 90
-        msg = f"📋 <b>卡住的任務列表</b> (進度 >= {list_min_progress}%)\n"
+        msg = f"📋 <b>失敗與停滯任務</b> (停滯進度 >= {list_min_progress}%)\n"
         msg += "─" * 25 + "\n"
 
-        total_stuck = 0
+        total_stuck = failures = 0
         for account in USER:
-            stuck = get_stuck_tasks(account, list_min_progress)
+            try:
+                stuck = get_stuck_tasks(account, list_min_progress)
+            except Exception as exc:
+                failures += 1
+                msg += f'❌ {escape(account)} 查詢失敗：{escape(str(exc))}\n'
+                continue
             if stuck:
                 msg += f"\n<b>帳號: {account}</b>\n"
                 for task in stuck:
                     msg += f"  • {task['name']} ({task['progress']}%)\n"
                 total_stuck += len(stuck)
 
-        if total_stuck == 0:
-            msg += f"\n✅ 沒有找到卡住的任務"
-        else:
-            msg += f"\n─" + "─" * 24 + "\n"
+        if total_stuck == 0 and not failures:
+            msg += "\n✅ 沒有找到卡住的任務"
+        elif total_stuck:
+            msg += "\n─" + "─" * 24 + "\n"
             msg += f"共 {total_stuck} 個任務卡住"
 
         context.bot.send_message(
@@ -524,7 +537,7 @@ def retry(update: Update, context: CallbackContext):
 
     context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text=f'🔄 正在查找並重試進度 >= {min_progress}% 的卡住任務...'
+        text=f'🔄 正在檢查失敗與停滯任務（停滯進度 >= {min_progress}%）...'
     )
 
     total_success = 0
@@ -533,7 +546,7 @@ def retry(update: Update, context: CallbackContext):
 
     notifier = TelegramNotifier(context.bot, update.effective_chat.id)
     for account in USER:
-        success, fail, results = retry_stuck_tasks(account, min_progress, delete_cloud_files=True, notifier=notifier)
+        success, fail, results = retry_stuck_tasks(account, min_progress, delete_cloud_files=False, notifier=notifier)
         total_success += success
         total_fail += fail
         if results:
@@ -542,17 +555,17 @@ def retry(update: Update, context: CallbackContext):
     if total_success + total_fail == 0:
         context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=f'✅ 沒有找到進度 >= {min_progress}% 的卡住任務'
+            text=f'✅ 沒有可重試的失敗或停滯任務（停滯進度 >= {min_progress}%）'
         )
         return
 
-    msg = f"📋 <b>重試結果</b>\n"
+    msg = "📋 <b>重試結果</b>\n"
     msg += f"✅ 成功: {total_success}  ❌ 失敗: {total_fail}\n"
 
     for item in all_results:
         for r in item['results']:
             icon = "✅" if r['status'] == 'success' else "❌"
-            msg += f"{icon} {r['name']}\n"
+            msg += f"{icon} {escape(r['name'])} — {escape(str(r.get('message', '')))}\n"
 
     context.bot.send_message(
         chat_id=update.effective_chat.id,
@@ -686,9 +699,11 @@ def dl_cmd(update: Update, context: CallbackContext):
         return
 
     notifier = TelegramNotifier(context.bot, update.effective_chat.id)
-    t = threading.Thread(target=download_cloud_file, args=[notifier, file_id, account])
-    thread_list.append(t)
-    t.start()
+    try:
+        submit_cloud_file(notifier, file_id, account)
+    except (ValueError, RuntimeError) as exc:
+        context.bot.send_message(chat_id=update.effective_chat.id, text=f'❌ {exc}')
+        return
 
     context.bot.send_message(chat_id=update.effective_chat.id,
                              text=f'📥 已開始下載 PikPak file `{file_id}` (帳號 `{account}`)',
@@ -706,63 +721,18 @@ def handle_callback(update: Update, context: CallbackContext):
     data = query.data or ''
     if data.startswith('retry:'):
         task_id = data.split(':', 1)[1]
-        task = state.get_task(task_id)
-        if not task:
-            try:
-                query.edit_message_reply_markup(reply_markup=None)
-                context.bot.send_message(chat_id=query.message.chat_id,
-                                         text=f'❌ 找不到任務 {task_id}')
-            except Exception:
-                pass
-            return
-
-        magnet = task.get('magnet')
-        if not magnet:
-            context.bot.send_message(chat_id=query.message.chat_id,
-                                     text=f'❌ 任務 {task_id} 沒有原始 magnet，無法重試（可能是 resume 任務）')
-            return
-
-        # Clean up the failed attempt's local download dir before re-running so
-        # leftover .aria2 partials and the broken big file don't pile up.
-        cleaned, cleanup_msg = cleanup_failed_download_dir(task.get('name'))
-        logging.info(f"retry cleanup for {task_id} ({task.get('name')}): {cleanup_msg}")
-        if cleaned:
-            context.bot.send_message(chat_id=query.message.chat_id,
-                                     text=f'🧹 已清掉舊下載資料夾 `{task.get("name")}`',
-                                     parse_mode='Markdown')
-
-        # Also cancel any old PikPak offline tasks with the same name (could be
-        # still 'downloading' or a completed one whose cloud folder is now an
-        # orphan). delete_files=True nukes the cloud folder too so the user
-        # doesn't end up with duplicate PikPak downloads/folders after retry.
-        task_name = task.get('name')
-        task_account = task.get('account')
-        if task_name and task_account:
-            try:
-                matched, ok, bad = cancel_offline_tasks_by_name(
-                    task_account, task_name, delete_cloud_files=True
-                )
-                if matched:
-                    logging.info(
-                        f"retry cloud cleanup for {task_id}: matched={matched} deleted={ok} failed={bad}"
-                    )
-            except Exception as e:
-                logging.warning(f"retry cloud cleanup for {task_id} failed (continuing): {e}")
-
         notifier = TelegramNotifier(context.bot, query.message.chat_id)
-        thread_list.append(threading.Thread(
-            target=process_magnet,
-            args=[notifier, magnet, None, None, None, None],
-        ))
-        thread_list[-1].start()
-
-        # Remove the buttons so the user can't double-click
+        try:
+            child = retry_task(notifier, task_id)
+        except (ValueError, RuntimeError) as exc:
+            context.bot.send_message(chat_id=query.message.chat_id, text=f'❌ {exc}')
+            return
         try:
             query.edit_message_reply_markup(reply_markup=None)
         except Exception:
-            pass
+            logging.warning('Could not remove stale retry button for %s', task_id)
         context.bot.send_message(chat_id=query.message.chat_id,
-                                 text=f'🔄 任務 {task_id} 已重新加入佇列')
+                                 text=f'🔄 任務 {task_id} 已接續為 {child}')
 
     elif data.startswith('dismiss:'):
         try:
