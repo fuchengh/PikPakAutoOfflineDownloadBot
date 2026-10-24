@@ -188,3 +188,7 @@ docker run \
 - [666wcy/pikpakdown](https://github.com/666wcy/pikpakdown)
 - [mumuchenchen/pikpak](https://github.com/mumuchenchen/pikpak)
 - [Quan666/PikPakAPI](https://github.com/Quan666/PikPakAPI)
+
+## 雲端冷卻與桌面整合
+
+PikPak 限流時，同帳號登入、查詢及提交共用跨重啟保留的冷卻；結果不明的提交不自動重送。Bot 可獨立啟動健康探測，並保留另行安裝的 pikpak-next Desktop API。詳見 [冷卻、repo 分工與升級說明](docs/cloud-cooldown.md)。

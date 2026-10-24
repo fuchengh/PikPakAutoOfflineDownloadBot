@@ -103,6 +103,8 @@ def _offline(task_id, notifier):
         accounts = [row['account']] if row['account'] else list(USER)
         for account in accounts:
             try:
+                from pikpakbot.pikpak_client import prepare_submission
+                prepare_submission(account)
                 state.update_task(task_id, submission_started=1, account=account)
                 cloud_id, name = magnet_upload(row['magnet'], account, offline_path=row['offline_path'])
                 state.update_task(task_id, account=account, name=name, cloud_task_id=cloud_id)
@@ -399,6 +401,10 @@ def _run_task(task_id, notifier, batch_id=None):
 
 
 def _restore_notifier(row, fallback):
+    from pikpakbot.desktop import restore_notifier
+    desktop = restore_notifier(row)
+    if desktop is not None:
+        return desktop
     from pikpakbot.notifier import DiscordNotifier
     if row.get('discord_channel_id'):
         return DiscordNotifier(row['discord_channel_id'])
@@ -412,6 +418,8 @@ def retry_offline_candidates(account, min_progress, notifier=None, *, automatic=
     for cloud in get_stuck_tasks(account, min_progress, include_errors=not automatic):
         try:
             row = state.latest_cloud_task(account, cloud['id'])
+            if automatic and row is None:
+                continue  # Never adopt an untracked/uncertain cloud submission automatically.
             if row and row['stage'] not in state.TERMINAL_STAGES:
                 if row['stage'] == state.STAGE_OFFLINE and not automatic:
                     if state.request_offline_retry(row['task_id']):
@@ -455,6 +463,9 @@ def stuck_task_watchdog(admin_notifier):
     while True:
         sleep(60)
         for account in list(USER):
+            from pikpakbot.cloud_guard import guard
+            if guard.account_status(account)['status'] != 'ok':
+                continue  # Only the read-only health probe may test recovery.
             try:
                 retry_offline_candidates(account, 0, admin_notifier, automatic=True)
             except Exception:

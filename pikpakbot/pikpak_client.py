@@ -1,8 +1,9 @@
+import time
+from pikpakbot.cloud_guard import guard, CloudBlocked, rate_limited
 import asyncio
 import logging
 import threading
 from time import sleep, monotonic
-from random import uniform
 
 from pikpakbot.http import session
 from pikpakbot import state
@@ -50,53 +51,53 @@ class AmbiguousMutation(PikPakError):
 
 def _pikpak_request(method, url, account, *, max_attempts=DEFAULT_MAX_ATTEMPTS,
                     timeout=DEFAULT_TIMEOUT, **kwargs):
-    """Strict responses; retry transient reads with jitter, never return partial data.
-
-    A timed-out mutation may have succeeded: don't blindly duplicate POSTs.
-    Authentication refresh has its own one-shot budget.
-    """
-    relogin_used = False
-    attempt = 0
-    while attempt < max_attempts:
-        try:
-            resp = session().request(method, url, headers=get_headers(account),
-                                     timeout=timeout, **kwargs)
-        except (requests.Timeout, requests.ConnectionError):
-            attempt += 1
-            if method.upper() not in ('GET', 'DELETE') or attempt >= max_attempts:
-                raise
-            sleep(2 ** (attempt - 1) + uniform(0, 1))
-            continue
-        try:
-            data = resp.json() if resp.content else {}
-        except ValueError as exc:
-            error_type = AmbiguousMutation if method.upper() == 'POST' else PikPakError
-            raise error_type(f'PikPak HTTP {resp.status_code}: invalid JSON') from exc
-        if not isinstance(data, dict):
-            error_type = AmbiguousMutation if method.upper() == 'POST' else PikPakError
-            raise error_type('PikPak 回應不是 JSON object')
-        if (resp.status_code == 401 or str(data.get('error_code')) == '16') and not relogin_used:
-            login(account)
-            relogin_used = True
-            continue
-        description = str(data.get('error_description') or data.get('error') or '')
-        transient = resp.status_code == 429 or (resp.status_code >= 500 and method.upper() == 'GET')
-        if transient:
-            attempt += 1
-            if attempt < max_attempts:
+    # One account lock covers request + auth refresh. Other callers see the
+    # saved breaker before issuing network I/O. Only explicit 401 is replayed.
+    sent = False
+    try:
+        with guard.lock(account):
+            for auth_attempt in range(2):
+                guard.check(account)
                 try:
-                    wait = min(60, max(0, float(resp.headers.get('Retry-After', 0))))
-                except (ValueError, TypeError):
-                    wait = 0
-                sleep(max(wait, 2 ** attempt) + uniform(0, 1))
-                continue
-        if resp.status_code >= 400 or data.get('error') or data.get('error_code') not in (None, 0, '0'):
-            error_type = AmbiguousMutation if method.upper() == 'POST' and resp.status_code >= 500 else PikPakError
-            raise error_type(f'PikPak HTTP {resp.status_code}, code={data.get("error_code")}: {description}')
-        if method.upper() != 'GET':
-            invalidate_offline(account)
-        return resp, data
-    raise PikPakError('PikPak 暫時錯誤重試次數已用盡')
+                    headers = get_headers(account)
+                    sent = True
+                    resp = session().request(method, url, headers=headers, timeout=timeout, **kwargs)
+                except requests.RequestException:
+                    guard.fail(account)
+                    raise  # The pipeline retains uncertain POST ownership.
+                try:
+                    data = resp.json() if resp.content else {}
+                    if not isinstance(data, dict):
+                        raise ValueError('not an object')
+                except ValueError:
+                    guard.fail(account, 'rate_limit' if resp.status_code == 429 else 'transient', resp.headers.get('Retry-After'))
+                    error = AmbiguousMutation if method.upper() == 'POST' else PikPakError
+                    raise error(f'PikPak HTTP {resp.status_code}: invalid JSON') from None
+                description = str(data.get('error_description') or data.get('error') or '')
+                if rate_limited(resp.status_code, description):
+                    guard.fail(account, 'rate_limit', resp.headers.get('Retry-After'))
+                    error = AmbiguousMutation if method.upper() == 'POST' and resp.status_code >= 500 else PikPakError
+                    raise error(guard.account_status(account)['message'])
+                if resp.status_code >= 500:
+                    guard.fail(account, retry_after=resp.headers.get('Retry-After'))
+                    error = AmbiguousMutation if method.upper() == 'POST' else PikPakError
+                    raise error(f'PikPak HTTP {resp.status_code}；已暫停請求並延後重試')
+                if resp.status_code == 401 or str(data.get('error_code')) == '16':
+                    if not auth_attempt:
+                        login(account)
+                        continue
+                    guard.fail(account, 'auth', resp.headers.get('Retry-After'))
+                    raise PikPakError('PikPak 雲端驗證失敗，已延後重新確認')
+                if resp.status_code >= 400 or data.get('error') or data.get('error_code') not in (None, 0, '0'):
+                    raise PikPakError(f'PikPak HTTP {resp.status_code}, code={data.get("error_code")}: {description}')
+                guard.success(account)
+                if method.upper() != 'GET':
+                    invalidate_offline(account)
+                return resp, data
+    except CloudBlocked as exc:
+        if sent and method.upper() == 'POST':
+            raise AmbiguousMutation(str(exc)) from None
+        raise PikPakError(str(exc)) from None
 
 
 def registerFuc():
@@ -127,47 +128,86 @@ def auto_delete_judge(account):
 
 
 def login(account):
-    with login_lock:
-        index = USER.index(account)
+    try:
+        with guard.lock(account):
+            guard.check(account)
+            old = pikpak_clients.get(account)
+            response_meta = {}
 
-        login_admin = account
-        login_password = PASSWORD[index]
+            async def observe(response):
+                await response.aread()
+                response_meta.update(status=response.status_code,
+                                     retry_after=response.headers.get('Retry-After'))
+                try:
+                    response_meta['body'] = response.json()
+                except ValueError:
+                    response_meta['body'] = ''
+                body = response_meta['body']
+                # SDK 0.1.11 recursively refreshes on error_code 16, including
+                # failures of the refresh endpoint itself. Stop that path before
+                # its response handler; this policy owns the one-shot fallback.
+                if response.status_code >= 400 or (isinstance(body, dict) and (
+                    body.get('error') or body.get('error_code') not in (None, 0, '0'))):
+                    raise PikPakError('PikPak authentication request rejected')
 
-        client = PikPakApi(
-            username=login_admin,
-            password=login_password,
-        )
+            client = PikPakApi(username=account, password=PASSWORD[USER.index(account)],
+                encoded_token=getattr(old, 'encoded_token', None),
+                request_max_retries=1, request_initial_backoff=0,
+                httpx_client_args={'timeout': 30, 'event_hooks': {'response': [observe]}})
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(client.login())
-            loop.run_until_complete(client.refresh_access_token())
-        finally:
-            loop.close()
-        headers = client.get_headers()
-        pikpak_headers[account] = headers.copy()
-        pikpak_clients[account] = client
+            async def authenticate():
+                try:
+                    if getattr(client, 'refresh_token', None):
+                        try:
+                            await client.refresh_access_token()
+                        except Exception:
+                            # Only an explicit rejected refresh allows password login.
+                            body = str(response_meta.get('body', '')).lower()
+                            if rate_limited(response_meta.get('status'), body):
+                                raise
+                            if (response_meta.get('status') or 0) >= 500:
+                                raise
+                            if response_meta.get('status') != 401 and 'invalid_grant' not in body:
+                                raise
+                            await client.login()
+                    else:
+                        await client.login()
+                finally:
+                    await client.httpx_client.aclose()
 
-        logging.info(f"帳號{account}登入成功！")
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(authenticate())
+            except Exception as exc:
+                limited = rate_limited(response_meta.get('status'), str(exc) + str(response_meta.get('body', '')))
+                reason = 'rate_limit' if limited else 'auth' if response_meta.get('status') in (400, 401, 403) else 'transient'
+                guard.fail(account, reason, response_meta.get('retry_after'))
+                raise PikPakError(guard.account_status(account)['message']) from None
+            finally:
+                loop.close()
+            pikpak_headers[account] = client.get_headers().copy()
+            pikpak_clients[account] = client
+            # Login alone does not prove that the drive API is available.
+    except CloudBlocked as exc:
+        raise PikPakError(str(exc)) from None
 
 
 def get_headers(account):
-    with login_lock:
-        if account not in USER:
-            raise PikPakError('帳號已移除')
-        if account not in pikpak_headers:
-            login(account)
-        return pikpak_headers[account].copy()
+    try:
+        with guard.lock(account):
+            guard.check(account)
+            if account not in USER:
+                raise PikPakError('帳號已移除')
+            if account not in pikpak_headers:
+                login(account)
+            return pikpak_headers[account].copy()
+    except CloudBlocked as exc:
+        raise PikPakError(str(exc)) from None
 
 
 def get_clients(account):
-    with login_lock:
-        if account not in USER:
-            raise PikPakError('帳號已移除')
-        if account not in pikpak_clients:
-            login(account)
-        return pikpak_clients[account]
+    get_headers(account)
+    return pikpak_clients[account]
 
 
 def magnet_upload(file_url, account, parent_id=None, offline_path=None):
@@ -498,3 +538,56 @@ def get_my_vip(account):
         return 1
     else:
         return 2
+
+
+def cloud_status():
+    return guard.status(list(USER))
+
+def check_cloud_available(account=None):
+    accounts = [account] if account else list(USER)
+    states = [guard.account_status(a) for a in accounts]
+    if not any(s['status'] == 'ok' for s in states):
+        raise PikPakError(cloud_status()['message'] + '；請等待雲端確認後再操作')
+
+def prepare_submission(account):
+    # Authentication failures before a POST are not uncertain submissions.
+    try:
+        with guard.lock(account):
+            guard.check(account)
+            check_cloud_available(account)
+            get_headers(account)
+    except CloudBlocked as exc:
+        raise PikPakError(str(exc)) from None
+
+def probe_cloud(account):
+    with guard.lock(account):
+        status = guard.account_status(account)
+        if status['status'] in ('cooldown', 'error'):
+            return
+        if status['status'] == 'ok' and time.time() - (status.get('last_success') or 0) < 300:
+            return
+        # A bounded GET; no adoption, state.observe, task writes or submissions.
+        try:
+            _pikpak_request('GET', f'{PIKPAK_API_URL}/drive/v1/tasks', account,
+                            params={'type': 'offline', 'limit': 1})
+        except PikPakError:
+            guard.fail(account)
+
+def start_cloud_monitor():
+    global _cloud_monitor_started
+    with login_lock:
+        if globals().get('_cloud_monitor_started'):
+            return
+        _cloud_monitor_started = True
+
+    def monitor():
+        while True:
+            for account in list(USER):
+                try:
+                    probe_cloud(account)
+                except Exception:
+                    # Safe fixed text: never log tokens, account or response body.
+                    logging.warning('PikPak cloud probe unavailable; cooldown retained')
+            sleep(5)
+
+    threading.Thread(target=monitor, name='pikpak-cloud-health', daemon=True).start()
