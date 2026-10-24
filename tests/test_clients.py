@@ -86,15 +86,18 @@ def test_account_cache_does_not_follow_list_indices(monkeypatch):
         pk.get_clients('b')
 
 
-def test_http_retries_transient_read_and_auth_has_separate_budget(monkeypatch):
+def test_http_refreshes_once_then_defers_transient_read_to_cooldown(monkeypatch):
     transport = Mock()
     transport.request.side_effect = [response({}, 401), response({}, 503), response({'tasks': []})]
     monkeypatch.setattr(pk, 'session', lambda: transport)
     monkeypatch.setattr(pk, 'get_headers', lambda _: {})
     login = Mock()
     monkeypatch.setattr(pk, 'login', login)
-    assert pk._pikpak_request('GET', 'url', 'a', max_attempts=2)[1] == {'tasks': []}
-    assert transport.request.call_count == 3
+    with pytest.raises(pk.PikPakError, match='503'):
+        pk._pikpak_request('GET', 'url', 'a', max_attempts=2)
+    with pytest.raises(pk.PikPakError, match='冷卻'):
+        pk._pikpak_request('GET', 'url', 'a')
+    assert transport.request.call_count == 2
     login.assert_called_once_with('a')
 
 

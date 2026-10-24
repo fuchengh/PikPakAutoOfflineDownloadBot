@@ -8,7 +8,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import config
-from pikpakbot import pipeline, pikpak_client, state
+from pikpakbot import pipeline, pikpak_client, state, cloud_guard
 
 
 @pytest.fixture(autouse=True)
@@ -22,11 +22,22 @@ def isolated(monkeypatch, tmp_path):
     import aiohttp
     from unittest.mock import AsyncMock
     monkeypatch.setattr(httpx.Client, 'send', Mock(side_effect=AssertionError('Network forbidden')))
-    monkeypatch.setattr(httpx.AsyncClient, 'send', AsyncMock(side_effect=AssertionError('Network forbidden')))
+    original_send = httpx.AsyncClient.send
+    async def send_mock_transport(client, *args, **kwargs):
+        if not isinstance(client._transport, httpx.MockTransport):
+            raise AssertionError('Network forbidden')
+        return await original_send(client, *args, **kwargs)
+    monkeypatch.setattr(httpx.AsyncClient, 'send', send_mock_transport)
     monkeypatch.setattr(aiohttp.ClientSession, '_request', AsyncMock(side_effect=AssertionError('Network forbidden')))
     monkeypatch.setattr(pikpak_client, '_snapshots', {})
     monkeypatch.setattr(pikpak_client, '_snapshot_locks', {})
-    monkeypatch.setattr(pikpak_client, 'pikpak_headers', {})
+    guard = cloud_guard.CloudGuard(tmp_path / 'cloud-status.json')
+    for account in ('a', 'b'):
+        guard.success(account)
+    monkeypatch.setattr(cloud_guard, 'guard', guard)
+    monkeypatch.setattr(pikpak_client, 'guard', guard)
+    monkeypatch.setattr(pikpak_client, 'USER', ['a', 'b'])
+    monkeypatch.setattr(pikpak_client, 'pikpak_headers', {'a': {}, 'b': {}})
     monkeypatch.setattr(pikpak_client, 'pikpak_clients', {})
     monkeypatch.setattr(config, 'AUTO_DELETE', {})
     monkeypatch.setattr(pikpak_client, 'AUTO_DELETE', {})

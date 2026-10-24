@@ -7,6 +7,8 @@ from pikpakbot import build_telegram, state
 from pikpakbot.bot.telegram import register_handlers
 from pikpakbot.notifier import CompositeNotifier, DiscordNotifier, NullNotifier, TelegramNotifier
 from pikpakbot.pipeline import startup_recovery, stuck_task_watchdog
+from pikpakbot.pikpak_client import start_cloud_monitor
+from pikpakbot.desktop import start_api
 
 
 def _configure_logging():
@@ -65,6 +67,9 @@ def main():
     discord_enabled = _maybe_start_discord()
 
     admin_notifier = _build_admin_notifier(discord_enabled, updater)
+
+    start_cloud_monitor()
+    start_api()
 
     if discord_enabled:
         from time import sleep
