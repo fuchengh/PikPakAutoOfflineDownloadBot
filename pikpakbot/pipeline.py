@@ -105,12 +105,18 @@ def _offline(task_id, notifier):
             try:
                 from pikpakbot.pikpak_client import prepare_submission
                 prepare_submission(account)
-                state.update_task(task_id, submission_started=1, account=account)
-                cloud_id, name = magnet_upload(row['magnet'], account, offline_path=row['offline_path'])
+                def before_send():
+                    state.update_task(task_id, submission_started=1, account=account)
+                def on_rejected():
+                    state.update_task(task_id, submission_started=0)
+                cloud_id, name = magnet_upload(row['magnet'], account, offline_path=row['offline_path'],
+                                              before_send=before_send, on_rejected=on_rejected)
                 state.update_task(task_id, account=account, name=name, cloud_task_id=cloud_id)
                 state.claim(task_id, f'cloud-task:{account}:{cloud_id}')
                 break
             except (requests.RequestException, AmbiguousMutation) as exc:
+                if not state.get_task(task_id)['submission_started']:
+                    raise PikPakError(f'雲端準備失敗，尚未提交磁力，可稍後重試：{exc}') from exc
                 raise PikPakError(f'提交結果不確定，請先檢查 PikPak 離線列表，避免重複提交：{exc}') from exc
             except PikPakError as exc:
                 # A definite rejection is safe to retry; an unknown outcome is not.
@@ -164,9 +170,13 @@ def _offline(task_id, notifier):
         if manual or (stalled and phase in ('PHASE_TYPE_RUNNING', 'PHASE_TYPE_PENDING')):
             if not manual and row['auto_retries'] >= getattr(config, 'MAX_AUTO_RETRIES', 3):
                 raise PikPakError('離線任務持續停滯，自動重試次數已用盡')
-            state.update_task(task_id, retry_requested=0, retry_inflight=1, last_retry_at=time(),
-                              auto_retries=row['auto_retries'] + (0 if manual else 1))
-            ok, result = retry_offline_task(row['cloud_task_id'], row['account'])
+            def before_retry():
+                state.update_task(task_id, retry_requested=0, retry_inflight=1, last_retry_at=time(),
+                                  auto_retries=row['auto_retries'] + (0 if manual else 1))
+            def rejected_retry():
+                state.update_task(task_id, retry_inflight=0)
+            ok, result = retry_offline_task(row['cloud_task_id'], row['account'],
+                                           before_send=before_retry, on_rejected=rejected_retry)
             if not ok:
                 state.update_task(task_id, retry_inflight=0)
                 raise PikPakError(f'PikPak 重試失敗：{result}')

@@ -20,3 +20,5 @@ Bot 啟動時自行開啟唯讀健康探測，不依賴桌面程式或 Desktop A
 後續部署仍需確認 Bot／aria2 閒置，備份設定、SQLite、冷卻狀態及現有桌面 adapter，保留帳密與下載路徑。主機若有先前安裝器產生的修改，不要直接以 `git reset --hard` 覆蓋；先比對已部署檔案，測試完成後再安排服務更新。不要因冷卻到期而重送結果不明的任務。
 
 測試使用隔離 SQLite、模擬 HTTP 及測試專用 localhost aria2；包括同帳號並行、跨重啟冷卻、SDK refresh 失敗、POST 不重送、13 筆待確認資料／claims 保留，以及有／無桌面 adapter 的啟動和恢復路徑。
+
+提交標記與明確拒絕後的恢復邊界，見 [提交結果與重試恢復](mutation-recovery.md)。

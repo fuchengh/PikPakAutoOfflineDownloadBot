@@ -64,6 +64,7 @@ def test_retry_after_accepted_timeout_must_not_submit_magnet_twice(monkeypatch, 
     monkeypatch.setattr(p, 'USER', ['a'])
     accepted = []
     def upload(*args, **kwargs):
+        kwargs['before_send']()
         accepted.append('cloud-' + str(len(accepted) + 1))
         raise requests.Timeout('provider accepted upload; response was lost')
     monkeypatch.setattr(p, 'magnet_upload', upload)
@@ -119,7 +120,7 @@ def test_restart_of_queued_manual_retry_preserves_retry_intent(monkeypatch):
     monkeypatch.setattr(p, 'retry_offline_task', retry)
     monkeypatch.setattr(p, '_run_aria2_phase', Mock(return_value='done'))
     p._run_task(recovered, NullNotifier())
-    retry.assert_called_once_with('cloud', 'a')
+    assert retry.call_count == 1 and retry.call_args.args == ('cloud', 'a')
     assert state.get_task(recovered)['stage'] == state.STAGE_COMPLETE
     assert state.get_task(recovered)['retry_inflight'] == 0
 
@@ -139,7 +140,10 @@ def test_native_retry_unknown_outcome_is_not_replayed_after_restart(monkeypatch,
     state.claim(tid, 'source:' + p.source_key(magnet))
     state.claim(tid, 'cloud-task:a:old')
     monkeypatch.setattr(p, 'get_offline_list', lambda *args: [{'id': 'old', 'phase': 'PHASE_TYPE_ERROR'}])
-    retry = Mock(side_effect=SystemExit('crash') if crash else p.AmbiguousMutation('response lost'))
+    def dispatch(*args, **kwargs):
+        kwargs['before_send']()
+        raise SystemExit('crash') if crash else p.AmbiguousMutation('response lost')
+    retry = Mock(side_effect=dispatch)
     monkeypatch.setattr(p, 'retry_offline_task', retry)
     if crash:
         with pytest.raises(SystemExit):
@@ -161,7 +165,7 @@ def test_native_retry_unknown_outcome_is_not_replayed_after_restart(monkeypatch,
 def test_definite_native_retry_rejection_is_retryable(monkeypatch):
     tid = state.create_task(account='a', cloud_task_id='old', retry_requested=1)
     monkeypatch.setattr(p, 'get_offline_list', lambda *args: [{'id': 'old', 'phase': 'PHASE_TYPE_ERROR'}])
-    monkeypatch.setattr(p, 'retry_offline_task', lambda *args: (False, 'quota rejected'))
+    monkeypatch.setattr(p, 'retry_offline_task', lambda *args, **kwargs: (False, 'quota rejected'))
     p._run_task(tid, NullNotifier())
     assert state.get_task(tid)['retry_inflight'] == 0
     child = p.retry_task(NullNotifier(), tid)
