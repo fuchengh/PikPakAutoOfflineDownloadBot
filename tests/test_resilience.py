@@ -161,7 +161,10 @@ def test_cloud_only_worker_cannot_retry_until_finalization_finishes(monkeypatch)
 @pytest.mark.parametrize('error', [requests.Timeout('timeout'), p.AmbiguousMutation('503 after submit')])
 def test_uncertain_submission_never_falls_back_to_another_account(monkeypatch, magnet, error):
     monkeypatch.setattr(p, 'USER', ['a', 'b'])
-    upload = Mock(side_effect=error)
+    def dispatch(*args, **kwargs):
+        kwargs['before_send']()
+        raise error
+    upload = Mock(side_effect=dispatch)
     monkeypatch.setattr(p, 'magnet_upload', upload)
     tid = state.create_task(magnet=magnet)
     p._run_task(tid, NullNotifier())

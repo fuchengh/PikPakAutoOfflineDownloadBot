@@ -50,7 +50,7 @@ class AmbiguousMutation(PikPakError):
 
 
 def _pikpak_request(method, url, account, *, max_attempts=DEFAULT_MAX_ATTEMPTS,
-                    timeout=DEFAULT_TIMEOUT, **kwargs):
+                    timeout=DEFAULT_TIMEOUT, before_send=None, on_rejected=None, **kwargs):
     # One account lock covers request + auth refresh. Other callers see the
     # saved breaker before issuing network I/O. Only explicit 401 is replayed.
     sent = False
@@ -60,20 +60,37 @@ def _pikpak_request(method, url, account, *, max_attempts=DEFAULT_MAX_ATTEMPTS,
                 guard.check(account)
                 try:
                     headers = get_headers(account)
+                    if before_send:
+                        before_send()
                     sent = True
                     resp = session().request(method, url, headers=headers, timeout=timeout, **kwargs)
                 except requests.RequestException:
                     guard.fail(account)
+                    if not sent:
+                        raise PikPakError('PikPak 請求尚未送出；可稍後重試') from None
                     raise  # The pipeline retains uncertain POST ownership.
                 try:
                     data = resp.json() if resp.content else {}
                     if not isinstance(data, dict):
                         raise ValueError('not an object')
                 except ValueError:
+                    # These statuses explicitly reject the write, even if a
+                    # proxy returned HTML. A 5xx/truncated success stays unknown.
+                    if resp.status_code in (401, 403, 429):
+                        if on_rejected:
+                            on_rejected()
+                        sent = False
                     guard.fail(account, 'rate_limit' if resp.status_code == 429 else 'transient', resp.headers.get('Retry-After'))
-                    error = AmbiguousMutation if method.upper() == 'POST' else PikPakError
+                    error = AmbiguousMutation if sent and method.upper() == 'POST' else PikPakError
                     raise error(f'PikPak HTTP {resp.status_code}: invalid JSON') from None
                 description = str(data.get('error_description') or data.get('error') or '')
+                rejected = resp.status_code < 500 and (resp.status_code >= 400 or
+                    data.get('error') or data.get('error_code') not in (None, 0, '0') or
+                    rate_limited(resp.status_code, description))
+                if rejected:
+                    if on_rejected:
+                        on_rejected()
+                    sent = False
                 if rate_limited(resp.status_code, description):
                     guard.fail(account, 'rate_limit', resp.headers.get('Retry-After'))
                     error = AmbiguousMutation if method.upper() == 'POST' and resp.status_code >= 500 else PikPakError
@@ -210,7 +227,7 @@ def get_clients(account):
     return pikpak_clients[account]
 
 
-def magnet_upload(file_url, account, parent_id=None, offline_path=None):
+def magnet_upload(file_url, account, parent_id=None, offline_path=None, *, before_send=None, on_rejected=None):
     if offline_path:
         if not offline_path.startswith('/') or '..' in offline_path.split('/'):
             raise ValueError('離線路徑必須是絕對路徑且不能包含 ..')
@@ -223,7 +240,8 @@ def magnet_upload(file_url, account, parent_id=None, offline_path=None):
                 _, folder = _pikpak_request('POST', f'{PIKPAK_API_URL}/drive/v1/files', account,
                     json={'kind': 'drive#folder', 'name': part, 'parent_id': parent_id or ''})
                 parent_id = folder['id']
-    _, result = _pikpak_request('POST', f'{PIKPAK_API_URL}/drive/v1/files', account, json={
+    _, result = _pikpak_request('POST', f'{PIKPAK_API_URL}/drive/v1/files', account,
+        before_send=before_send, on_rejected=on_rejected, json={
         'kind': 'drive#file', 'name': '', 'upload_type': 'UPLOAD_TYPE_URL',
         'url': {'url': file_url}, 'folder_type': 'DOWNLOAD' if not parent_id else '',
         'parent_id': parent_id,
@@ -432,7 +450,7 @@ def empty_trash(account):
     return False
 
 
-def retry_offline_task(task_id, account):
+def retry_offline_task(task_id, account, *, before_send=None, on_rejected=None):
     """
     使用 PikPak 的 RETRY 功能重新開始離線任務
     這會讓 PikPak 重新嘗試下載，不需要原始 magnet link
@@ -445,7 +463,8 @@ def retry_offline_task(task_id, account):
     }
 
     try:
-        _resp, result = _pikpak_request('POST', retry_url, account, json=retry_data)
+        _resp, result = _pikpak_request('POST', retry_url, account, json=retry_data,
+                                       before_send=before_send, on_rejected=on_rejected)
     except (requests.RequestException, AmbiguousMutation) as exc:
         raise AmbiguousMutation(f'PikPak RETRY 結果尚未確認：{exc}') from exc
     except PikPakError as e:

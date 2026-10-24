@@ -197,7 +197,10 @@ def test_stalled_offline_retries_are_bounded_and_no_deletions(monkeypatch):
     tid = state.create_task(cloud_task_id='cloud', account='a')
     monkeypatch.setattr(p, 'get_offline_list', lambda *a: [
         {'id': 'cloud', 'phase': 'PHASE_TYPE_RUNNING', 'progress': 99}])
-    retry, delete = Mock(return_value=(True, {})), Mock()
+    def dispatch(*args, **kwargs):
+        kwargs['before_send']()
+        return True, {}
+    retry, delete = Mock(side_effect=dispatch), Mock()
     monkeypatch.setattr(p, 'retry_offline_task', retry)
     monkeypatch.setattr(p, 'delete_files', delete)
     p._run_task(tid, NullNotifier())
@@ -212,7 +215,7 @@ def test_native_retry_new_id_stays_in_same_worker(monkeypatch):
         [{'id': 'old', 'phase': 'PHASE_TYPE_ERROR', 'progress': 0}],
         [{'id': 'new', 'phase': 'PHASE_TYPE_COMPLETE', 'progress': 100, 'file_id': 'file'}]])
     monkeypatch.setattr(p, 'get_offline_list', poll)
-    monkeypatch.setattr(p, 'retry_offline_task', lambda *a: (True, {'task': {'id': 'new'}}))
+    monkeypatch.setattr(p, 'retry_offline_task', lambda *a, **kw: (True, {'task': {'id': 'new'}}))
     assert p._offline(tid, NullNotifier()) == ('file', 'a')
     assert state.get_task(tid)['cloud_task_id'] == 'new'
     p._executor.submit.assert_not_called()
